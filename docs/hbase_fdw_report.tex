@@ -1,0 +1,118 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage{fontspec}
+\setmainfont{Latin Modern Roman}
+\setsansfont{Inter}[Scale=0.92]
+\setmonofont{Latin Modern Mono}[Scale=0.95]
+\usepackage[a4paper,left=0.8in,right=0.8in,top=0.65in,bottom=0.6in]{geometry}
+\usepackage{microtype}
+\usepackage{booktabs,tabularx,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{ink}{HTML}{1F2933}
+\definecolor{acc}{HTML}{1D4E89}
+\definecolor{soft}{HTML}{5B6B7C}
+
+\color{ink}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+
+\titleformat{\section}{\sffamily\large\bfseries\color{acc}}{}{0pt}{}[{\color{acc}\titlerule[0.6pt]}]
+\titlespacing*{\section}{0pt}{7pt}{4pt}
+\titleformat{\subsection}{\sffamily\normalsize\bfseries\color{acc}}{}{0pt}{}
+\titlespacing*{\subsection}{0pt}{4pt}{1pt}
+\setlist{nosep,leftmargin=1.5em,itemsep=2pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\renewcommand{\arraystretch}{1.25}
+
+\begin{document}
+
+\begin{center}
+{\sffamily\LARGE\bfseries\color{acc} hbase\_fdw: Querying HBase from PostgreSQL}\\[4pt]
+{\large CS631 Project}\\[2pt]
+\textbf{Yash Singh} (23B0934)\quad\textbf{J Adarsh} (23B0960)
+\end{center}
+\vspace{-4pt}
+
+\section*{Goal}
+Query data stored in HBase directly from PostgreSQL, without ever loading it into Postgres, and use HBase's own index (its sorted row keys) the way Postgres uses an index. HBase stays underneath as the storage engine; Postgres is a thin SQL layer on top. The idea mirrors \code{file\_fdw}, which reads text files in place, but targets a distributed store with a real index.
+
+\section*{The problem}
+The original wrapper treated every query as a full scan. All 10,000 rows crossed the Thrift gateway in batches, every value was converted to a Postgres type, and the \code{WHERE} clause was applied only afterwards, in Postgres. The planner saw one fixed cost for every query, so a one-row lookup and a full scan looked the same, and a join rescanned the table for every outer row (63 round trips for 3 outer rows in the test). Time tracked the table size, not the result size.
+
+\section*{The approach}
+\code{hbase\_fdw} is a C extension in \code{contrib}: a foreign data wrapper that maps columns to HBase column families and one row-key column, plus a hand-written Thrift client for the HBase gateway. Built in five steps:
+\begin{enumerate}
+\item \textbf{Point lookups.} \code{rowkey = value} becomes a direct HBase seek.
+\item \textbf{Ranges.} \code{BETWEEN}, \code{LIKE 'p\%'} and \code{starts\_with} become a start and stop row, pushed only where Postgres and HBase agree on byte order.
+\item \textbf{Key lists.} \code{IN} and \code{= ANY} use one batched get; a single-key lookup takes one round trip.
+\item \textbf{Cost-based planning.} Row estimates and a cost model (connect 10, 5 per round trip, 0.01 per row) tell the planner that key lookups are cheap. Row-key order is advertised, so \code{ORDER BY} skips the sort.
+\item \textbf{Index joins.} In a join on the row key, each outer row passes its key to HBase, which fetches only the matching row, like a nested-loop index scan. With a 10,000-row table this wins up to about 25 outer rows; beyond that, one full scan with a hash join is cheaper.
+\end{enumerate}
+\textbf{Why Postgres needs no index of its own.} A B-tree narrows the search by descending from the root to the matching leaf. HBase does the same on its side (\code{hbase:meta} to region, block index to data block, bloom filters skip files), so Postgres only turns the condition into a start and stop row or a key set. Nothing is copied and nothing goes stale. Every pushed condition is also rechecked locally, so pushdown can only save work, never change results; output was verified against an identical local table.
+
+\section*{Results}
+Real HBase 3.0 and PostgreSQL 18 on one machine, 10,000-row table, median of 10 to 50 runs. The old point lookups fetched all six columns (about 36 ms); the other queries needed only one or two columns.
+
+\medskip
+{\small
+\begin{tabularx}{\linewidth}{@{}Xrrr@{}}
+\toprule
+\textbf{Query} & \textbf{Before (ms)} & \textbf{Now (ms)} & \textbf{Speed-up}\\
+\midrule
+Point lookup \code{id = 'e004242'} & 36.8 & 1.47 & $\sim$26$\times$\\
+Point lookup, missing key & 35.9 & 1.16 & $\sim$33$\times$\\
+\code{LIKE 'e0042\%'}, 100 rows & 19.8 & 2.1 & $\sim$10$\times$\\
+\code{BETWEEN}, 100 rows & 18.8 & 2.4 & $\sim$8$\times$\\
+\code{ORDER BY id LIMIT 10} & 20.0 & 3.8 & $\sim$5$\times$\\
+\code{id IN} (100 keys) & 20.6 & 7.5 & $\sim$3$\times$\\
+Join, 20 outer rows & 18.2 & 13.1 & 1.4$\times$\\
+Full scan \code{count(*)} & 18.6 & 19.1 & same\\
+Join, 1,000 outer rows & 18.5 & 21.5 & same (hash join)\\
+\bottomrule
+\end{tabularx}}
+
+\smallskip
+The limit is HBase's own: only the row key is indexed, so a filter such as \code{salary > 50000} still reads the whole table.
+
+\clearpage
+\section*{Next implementation steps}
+\subsection*{Cost model and joins}
+\begin{itemize}
+\item \textbf{Charge per byte per column}, so wide rows cost more than key-only scans (the 36 ms against 19 ms gap above is not modelled yet).
+\item \textbf{Estimate table size from HBase region sizes}, so the \code{rows} option no longer has to be kept up to date by hand.
+\item \textbf{Batch join lookups}: gather many outer keys (for example 500) into one get, so nested loops stay cheaper well past 25 rows.
+\item \textbf{Cache fetched rows} to cut repeated requests, and add \textbf{parameterized range scans} for conditions such as \code{e.id BETWEEN o.lo AND o.hi}.
+\end{itemize}
+
+\subsection*{PostgreSQL features not yet used}
+Both groups fit inside the existing \code{contrib/hbase\_fdw} folder.
+
+\medskip
+{\small
+\begin{tabularx}{\linewidth}{@{}>{\ttfamily}lX@{}}
+\toprule
+\multicolumn{2}{@{}l}{\textbf{FDW callbacks}}\\
+\midrule
+AnalyzeForeignTable & \code{ANALYZE} samples HBase rows for real statistics, replacing the manual \code{rows} option\\
+GetForeignUpperPaths & push aggregates, \code{ORDER BY} and \code{LIMIT} into HBase, or stop scans early\\
+GetForeignJoinPaths & push a join between two HBase tables to the server side\\
+ImportForeignSchema & \code{IMPORT FOREIGN SCHEMA} creates foreign tables from HBase's table and column-family list\\
+\midrule
+\multicolumn{2}{@{}l}{\textbf{Planner hooks} (easy to add, but must leave plans for ordinary tables untouched)}\\
+\midrule
+set\_rel\_pathlist\_hook & add or remove access paths for any table, including HBase ones\\
+set\_join\_pathlist\_hook & add join paths, such as a batched-lookup join\\
+create\_upper\_paths\_hook & add paths for aggregates, sorts and \code{LIMIT} above the scan\\
+get\_relation\_info\_hook & change what the planner believes about a table (size, indexes)\\
+\bottomrule
+\end{tabularx}}
+
+\medskip
+\textbf{Guiding principle.} Postgres stays a thin wrapper and never imports data: filtering and index use happen in HBase, so only a small result crosses the gateway. Copying large HBase tables into Postgres would duplicate storage and go stale.
+
+\end{document}

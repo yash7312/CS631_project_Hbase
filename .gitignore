@@ -1,0 +1,18 @@
+# everything setup.sh builds (PostgreSQL, HBase, data dirs)
+work/
+
+# build outputs
+*.o
+*.so
+*.bc
+*.orig
+
+# regression test output
+hbase_fdw/results/
+hbase_fdw/regression.diffs
+hbase_fdw/regression.out
+hbase_fdw/log/
+hbase_fdw/tmp_check/
+
+__pycache__/
+*.pyc

@@ -1,0 +1,1508 @@
+-- needs an HBase thrift server on localhost:9090 loaded by test/load_data.py
+-- (10000 emp rows); test/emp.csv is the same data for the local copy
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS hbase_fdw CASCADE;
+CREATE EXTENSION hbase_fdw;
+RESET client_min_messages;
+CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
+  OPTIONS (host 'localhost', port '9090');
+-- option validation
+CREATE SERVER bad FOREIGN DATA WRAPPER hbase_fdw OPTIONS (port '99999');
+ERROR:  port must be between 1 and 65535
+CREATE SERVER bad FOREIGN DATA WRAPPER hbase_fdw OPTIONS (hots 'x');
+ERROR:  invalid option "hots"
+HINT:  Valid options in this context are: host, port, timeout
+CREATE FOREIGN TABLE bad (a int OPTIONS (column 'nocolon')) SERVER hb;
+ERROR:  invalid HBase column "nocolon"
+HINT:  Use "family:qualifier".
+CREATE FOREIGN TABLE bad (a int) SERVER hb OPTIONS (batch_size '0');
+ERROR:  invalid value for option "batch_size": "0"
+HINT:  Expected an integer >= 1.
+-- name is NOT NULL: every emp row has info:name, so the FDW may project
+-- down to qualifiers
+CREATE FOREIGN TABLE emp (
+  id     text OPTIONS (rowkey 'true'),
+  name   text OPTIONS (column 'info:name') NOT NULL,
+  dept   text OPTIONS (column 'info:dept'),
+  joined date OPTIONS (column 'info:joined'),
+  salary int  OPTIONS (column 'pay:salary'),
+  bonus  numeric(10,2) OPTIONS (column 'pay:bonus')
+) SERVER hb OPTIONS (table 'emp', batch_size '500', rows '10000');
+-- same table, no NOT NULL promise, unmapped columns default to family info
+CREATE FOREIGN TABLE emp2 (
+  id   text OPTIONS (rowkey 'true'),
+  name text,
+  dept text,
+  salary int OPTIONS (column 'pay:salary')
+) SERVER hb OPTIONS (table 'emp', family 'info');
+CREATE TABLE emp_local (id text PRIMARY KEY, name text, dept text,
+                        joined date, salary int, bonus numeric(10,2));
+\copy emp_local from 'test/emp.csv' with (format csv)
+-- full scans
+SELECT count(*) FROM emp;
+ count 
+-------
+ 10000
+(1 row)
+
+SELECT * FROM emp ORDER BY id LIMIT 8;
+   id    |  name   | dept  |   joined   | salary |  bonus  
+---------+---------+-------+------------+--------+---------
+ e000001 | zoya_1  | hr    | 03-20-2016 |  98000 | 4652.44
+ e000002 | kabir_2 | quant | 03-05-2019 | 215000 | 3764.72
+ e000003 | ravi_3  | quant | 03-13-2011 | 187000 | 2713.13
+ e000004 | meera_4 | eng   | 04-02-2023 |  69000 | 1820.32
+ e000005 | arjun_5 | sales | 01-23-2020 | 272000 | 2033.83
+ e000006 | dev_6   | sales | 09-23-2014 | 215000 | 2388.76
+ e000007 | isha_7  | eng   | 12-17-2013 | 278000 |        
+ e000008 | dev_8   | ops   | 10-08-2020 |  63000 | 2722.79
+(8 rows)
+
+SELECT dept, count(*), sum(salary), count(bonus), round(avg(bonus), 2)
+  FROM emp GROUP BY dept ORDER BY dept;
+ dept  | count |    sum    | count |  round  
+-------+-------+-----------+-------+---------
+ eng   |  1959 | 328931000 |  1692 | 2468.34
+ hr    |  2072 | 339780000 |  1785 | 2520.89
+ ops   |  1970 | 327675000 |  1691 | 2538.23
+ quant |  1925 | 316488000 |  1620 | 2468.54
+ sales |  2074 | 340346000 |  1784 | 2454.58
+(5 rows)
+
+-- identical to the local copy, both directions
+SELECT count(*) AS missing FROM (TABLE emp_local EXCEPT TABLE emp) s;
+ missing 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS extra   FROM (TABLE emp EXCEPT TABLE emp_local) s;
+ extra 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS dup FROM (SELECT id FROM emp GROUP BY id HAVING count(*) > 1) s;
+ dup 
+-----
+   0
+(1 row)
+
+-- quals on non-key columns stay local: HBase has no index on them
+SELECT id, name, salary FROM emp WHERE id = 'e004242';
+   id    |   name    | salary 
+---------+-----------+--------
+ e004242 | ravi_4242 | 159000
+(1 row)
+
+SELECT count(*) FROM emp WHERE salary > 250000 AND joined >= '2020-01-01';
+ count 
+-------
+   716
+(1 row)
+
+SELECT count(*) FROM emp_local WHERE salary > 250000 AND joined >= '2020-01-01';
+ count 
+-------
+   716
+(1 row)
+
+-- row-key point lookups: one getRowsWithColumns call instead of a scan.
+-- hb_explain keeps the lines that matter and drops "actual rows", whose
+-- format differs between PG versions.
+CREATE FUNCTION hb_explain(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF l ~ 'Scan|Filter|HBase|Result' THEN
+      RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
+    END IF;
+  END LOOP;
+END $$;
+-- non-key qual: full scan, 10000 rows / 500 per batch = 20 RPCs + 1 empty
+SELECT hb_explain($$SELECT * FROM emp WHERE salary = 98000$$);
+           hb_explain           
+--------------------------------
+ Foreign Scan on emp
+   Filter: (salary = 98000)
+   Rows Removed by Filter: 9971
+   HBase Table: emp
+   HBase RPCs: 21
+(5 rows)
+
+-- key qual: 1 get
+SELECT hb_explain($$SELECT * FROM emp WHERE id = 'e004242'$$);
+                hb_explain                
+------------------------------------------
+ Foreign Scan on emp
+   Filter: (id = 'e004242'::text)
+   HBase Table: emp
+   HBase Key Cond: (id = 'e004242'::text)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT hb_explain($$SELECT * FROM emp WHERE 'e004242' = id AND salary > 0$$);
+                     hb_explain                      
+-----------------------------------------------------
+ Foreign Scan on emp
+   Filter: ((salary > 0) AND ('e004242'::text = id))
+   HBase Table: emp
+   HBase Key Cond: (id = 'e004242'::text)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT id, name, salary FROM emp WHERE 'e004242' = id;
+   id    |   name    | salary 
+---------+-----------+--------
+ e004242 | ravi_4242 | 159000
+(1 row)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id = 'nope'$$);
+                 hb_explain                  
+---------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id = 'nope'::text)
+         HBase Table: emp
+         HBase Key Cond: (id = 'nope'::text)
+         HBase Get Keys: 1
+         HBase RPCs: 1
+(6 rows)
+
+SELECT count(*) FROM emp WHERE id = 'nope';
+ count 
+-------
+     0
+(1 row)
+
+-- prefix of a real key is not a match
+SELECT count(*) FROM emp WHERE id = 'e00424';
+ count 
+-------
+     0
+(1 row)
+
+-- values known only at run time: prepared statement, init plan
+SET plan_cache_mode = force_generic_plan;
+PREPARE byid(text) AS SELECT id, name FROM emp WHERE id = $1;
+EXPLAIN (COSTS OFF) EXECUTE byid('e000007');
+         QUERY PLAN          
+-----------------------------
+ Foreign Scan on emp
+   Filter: (id = $1)
+   HBase Table: emp
+   HBase Key Cond: (id = $1)
+(4 rows)
+
+EXECUTE byid('e000007');
+   id    |  name  
+---------+--------
+ e000007 | isha_7
+(1 row)
+
+EXECUTE byid('e000123');
+   id    |   name    
+---------+-----------
+ e000123 | meera_123
+(1 row)
+
+EXECUTE byid(NULL);
+ id | name 
+----+------
+(0 rows)
+
+EXECUTE byid('');
+ id | name 
+----+------
+(0 rows)
+
+DEALLOCATE byid;
+RESET plan_cache_mode;
+SELECT hb_explain($$SELECT id FROM emp WHERE id = (SELECT 'e00000' || '9')$$);
+                 hb_explain                 
+--------------------------------------------
+ Foreign Scan on emp
+   Filter: (id = (InitPlan 1).col1)
+   HBase Table: emp
+   HBase Key Cond: (id = (InitPlan 1).col1)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+     ->  Result
+(7 rows)
+
+-- NULL key: no row can match, HBase is not contacted (0 RPCs)
+SELECT hb_explain($$SELECT id FROM emp WHERE id = (SELECT NULL::text)$$);
+                 hb_explain                 
+--------------------------------------------
+ Foreign Scan on emp
+   Filter: (id = (InitPlan 1).col1)
+   HBase Table: emp
+   HBase Key Cond: (id = (InitPlan 1).col1)
+   HBase RPCs: 0
+     ->  Result
+(6 rows)
+
+-- volatile values are not pushed down
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE id = 'e00000' || (random() * 0 + 5)::int;
+                                                      QUERY PLAN                                                      
+----------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on emp
+   Filter: (id = ('e00000'::text || ((((random() * '0'::double precision) + '5'::double precision))::integer)::text))
+   HBase Table: emp
+(3 rows)
+
+-- <> on the key: HBase can't skip anything, stays local
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE id <> 'e000001';
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on emp
+   Filter: (id <> 'e000001'::text)
+   HBase Table: emp
+(3 rows)
+
+-- every key we can look up agrees with the local copy
+SELECT count(*) AS mismatches FROM emp_local l
+  WHERE l.id IN ('e000001', 'e000500', 'e009999', 'e010000')
+    AND (SELECT row(f.*) FROM emp f WHERE f.id = l.id) IS DISTINCT FROM row(l.*);
+ mismatches 
+------------
+          0
+(1 row)
+
+-- other key types: varchar, bytea, integer (canonical text "12")
+CREATE FOREIGN TABLE emp_vc (id varchar(10) OPTIONS (rowkey 'true'),
+  name text OPTIONS (column 'info:name')) SERVER hb OPTIONS (table 'emp');
+SELECT hb_explain($$SELECT * FROM emp_vc WHERE id = 'e000010'$$);
+                hb_explain                
+------------------------------------------
+ Foreign Scan on emp_vc
+   Filter: ((id)::text = 'e000010'::text)
+   HBase Table: emp
+   HBase Key Cond: (id = 'e000010'::text)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT * FROM emp_vc WHERE id = 'e000010';
+   id    |   name   
+---------+----------
+ e000010 | meera_10
+(1 row)
+
+CREATE FOREIGN TABLE odd_b (k bytea OPTIONS (rowkey 'true'),
+  num int OPTIONS (column 'd:num')) SERVER hb OPTIONS (table 'odd');
+SELECT hb_explain($$SELECT * FROM odd_b WHERE k = '\x7232'$$);
+               hb_explain                
+-----------------------------------------
+ Foreign Scan on odd_b
+   Filter: (k = '\x7232'::bytea)
+   HBase Table: odd
+   HBase Key Cond: (k = '\x7232'::bytea)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT * FROM odd_b WHERE k = 'r2'::bytea;
+   k    | num 
+--------+-----
+ \x7232 |  -7
+(1 row)
+
+CREATE FOREIGN TABLE ikey (k int OPTIONS (rowkey 'true'),
+  sq int OPTIONS (column 'd:sq')) SERVER hb;
+SELECT hb_explain($$SELECT * FROM ikey WHERE k = 12$$);
+         hb_explain         
+----------------------------
+ Foreign Scan on ikey
+   Filter: (k = 12)
+   HBase Table: ikey
+   HBase Key Cond: (k = 12)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT * FROM ikey WHERE k = 12;
+ k  | sq  
+----+-----
+ 12 | 144
+(1 row)
+
+SELECT * FROM ikey WHERE k = 12::bigint;
+ k  | sq  
+----+-----
+ 12 | 144
+(1 row)
+
+SELECT * FROM ikey WHERE k = 1::smallint;
+ k | sq 
+---+----
+ 1 |  1
+(1 row)
+
+SELECT count(*) FROM ikey WHERE k = 13;
+ count 
+-------
+     0
+(1 row)
+
+-- row-key ranges: pushed only where Postgres order = HBase byte order, i.e.
+-- a C collation, bytea, or the ~<~ family; bounds intersect to one range
+CREATE FOREIGN TABLE emp_c (id text OPTIONS (rowkey 'true') COLLATE "C",
+  salary int OPTIONS (column 'pay:salary')) SERVER hb OPTIONS (table 'emp');
+SELECT hb_explain($$SELECT count(*) FROM emp_c WHERE id BETWEEN 'e000100' AND 'e000199'$$);
+                                 hb_explain                                  
+-----------------------------------------------------------------------------
+   ->  Foreign Scan on emp_c
+         Filter: ((id >= 'e000100'::text) AND (id <= 'e000199'::text))
+         HBase Table: emp
+         HBase Key Cond: (id >= 'e000100'::text) AND (id <= 'e000199'::text)
+         HBase Start Row: e000100
+         HBase Stop Row: e000199\x00
+         HBase RPCs: 2
+(7 rows)
+
+SELECT count(*), min(id), max(id) FROM emp_c WHERE id BETWEEN 'e000100' AND 'e000199';
+ count |   min   |   max   
+-------+---------+---------
+   100 | e000100 | e000199
+(1 row)
+
+SELECT hb_explain($$SELECT id FROM emp_c WHERE id > 'e009990' AND id >= 'e009000'$$);
+                              hb_explain                              
+----------------------------------------------------------------------
+ Foreign Scan on emp_c
+   Filter: ((id > 'e009990'::text) AND (id >= 'e009000'::text))
+   HBase Table: emp
+   HBase Key Cond: (id > 'e009990'::text) AND (id >= 'e009000'::text)
+   HBase Start Row: e009990\x00
+   HBase RPCs: 2
+(6 rows)
+
+SELECT id FROM emp_c WHERE id > 'e009995';
+   id    
+---------
+ e009996
+ e009997
+ e009998
+ e009999
+ e010000
+(5 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp_c WHERE 'e000005' > id$$);
+                   hb_explain                   
+------------------------------------------------
+   ->  Foreign Scan on emp_c
+         Filter: ('e000005'::text > id)
+         HBase Table: emp
+         HBase Key Cond: (id < 'e000005'::text)
+         HBase Stop Row: e000005
+         HBase RPCs: 2
+(6 rows)
+
+SELECT id FROM emp_c WHERE 'e000005' > id;
+   id    
+---------
+ e000001
+ e000002
+ e000003
+ e000004
+(4 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id <= 'e000003' COLLATE "C"$$);
+                         hb_explain                          
+-------------------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id <= 'e000003'::text COLLATE "C")
+         HBase Table: emp
+         HBase Key Cond: (id <= 'e000003'::text COLLATE "C")
+         HBase Stop Row: e000003\x00
+         HBase RPCs: 2
+(6 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id ~>=~ 'e009998'$$);
+                   hb_explain                    
+-------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id ~>=~ 'e009998'::text)
+         HBase Table: emp
+         HBase Key Cond: (id >= 'e009998'::text)
+         HBase Start Row: e009998
+         HBase RPCs: 2
+(6 rows)
+
+SELECT count(*) FROM emp WHERE id ~>=~ 'e009998';
+ count 
+-------
+     3
+(1 row)
+
+-- empty intersection, and nothing sorts below '': 0 RPCs
+SELECT hb_explain($$SELECT count(*) FROM emp_c WHERE id > 'e5' AND id < 'e1'$$);
+                           hb_explain                            
+-----------------------------------------------------------------
+   ->  Foreign Scan on emp_c
+         Filter: ((id > 'e5'::text) AND (id < 'e1'::text))
+         HBase Table: emp
+         HBase Key Cond: (id > 'e5'::text) AND (id < 'e1'::text)
+         HBase Start Row: e5\x00
+         HBase Stop Row: e1
+         HBase RPCs: 0
+(7 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp_c WHERE id < ''$$);
+               hb_explain                
+-----------------------------------------
+   ->  Foreign Scan on emp_c
+         Filter: (id < ''::text)
+         HBase Table: emp
+         HBase Key Cond: (id < ''::text)
+         HBase RPCs: 0
+(5 rows)
+
+SELECT count(*) FROM emp_c WHERE id >= '';
+ count 
+-------
+ 10000
+(1 row)
+
+-- not pushed: database collation (not C here), integer keys ('10' < '9')
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id < 'e000100'$$);
+               hb_explain               
+----------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id < 'e000100'::text)
+         Rows Removed by Filter: 9901
+         HBase Table: emp
+         HBase RPCs: 21
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM ikey WHERE k > 9;
+      QUERY PLAN      
+----------------------
+ Foreign Scan on ikey
+   Filter: (k > 9)
+   HBase Table: ikey
+(3 rows)
+
+SELECT k FROM ikey WHERE k > 9 ORDER BY k;
+ k  
+----
+ 10
+ 11
+ 12
+(3 rows)
+
+-- run-time bounds
+SET plan_cache_mode = force_generic_plan;
+PREPARE rg(text, text) AS SELECT count(*) FROM emp_c WHERE id >= $1 AND id < $2;
+EXPLAIN (COSTS OFF) EXECUTE rg('e000100', 'e000200');
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on emp_c
+         Filter: ((id >= $1) AND (id < $2))
+         HBase Table: emp
+         HBase Key Cond: (id >= $1) AND (id < $2)
+(5 rows)
+
+EXECUTE rg('e000100', 'e000200');
+ count 
+-------
+   100
+(1 row)
+
+EXECUTE rg('e000200', 'e000100');
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rg(NULL, 'e000100');
+ count 
+-------
+     0
+(1 row)
+
+DEALLOCATE rg;
+RESET plan_cache_mode;
+-- key prefixes: LIKE 'p%', starts_with, ^@ read [p, p+1)
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id LIKE 'e0001%'$$);
+                   hb_explain                   
+------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id ~~ 'e0001%'::text)
+         HBase Table: emp
+         HBase Key Cond: (id ~~ 'e0001%'::text)
+         HBase Start Row: e0001
+         HBase Stop Row: e0002
+         HBase RPCs: 2
+(7 rows)
+
+SELECT count(*) FROM emp WHERE id LIKE 'e0001%';
+ count 
+-------
+   100
+(1 row)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE starts_with(id, 'e0099')$$);
+                   hb_explain                   
+------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: starts_with(id, 'e0099'::text)
+         HBase Table: emp
+         HBase Key Cond: (id ^@ 'e0099'::text)
+         HBase Start Row: e0099
+         HBase Stop Row: e009:
+         HBase RPCs: 2
+(7 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id ^@ 'e0099'$$);
+                  hb_explain                   
+-----------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id ^@ 'e0099'::text)
+         HBase Table: emp
+         HBase Key Cond: (id ^@ 'e0099'::text)
+         HBase Start Row: e0099
+         HBase Stop Row: e009:
+         HBase RPCs: 2
+(7 rows)
+
+SELECT count(*) FROM emp WHERE id ^@ 'e0099';
+ count 
+-------
+   100
+(1 row)
+
+-- no wildcard: a point lookup; leading wildcard: nothing to push
+SELECT hb_explain($$SELECT id FROM emp WHERE id LIKE 'e000123'$$);
+                hb_explain                 
+-------------------------------------------
+ Foreign Scan on emp
+   Filter: (id ~~ 'e000123'::text)
+   HBase Table: emp
+   HBase Key Cond: (id ~~ 'e000123'::text)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE id LIKE '%1';
+          QUERY PLAN          
+------------------------------
+ Foreign Scan on emp
+   Filter: (id ~~ '%1'::text)
+   HBase Table: emp
+(3 rows)
+
+-- not pushed: ILIKE, value LIKE key
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE id ILIKE 'e0001%';
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on emp
+   Filter: (id ~~* 'e0001%'::text)
+   HBase Table: emp
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE 'e000123' LIKE id;
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on emp
+   Filter: ('e000123'::text ~~ id)
+   HBase Table: emp
+(3 rows)
+
+-- escapes and multibyte characters (keys sorted by bytes, n = position)
+CREATE FOREIGN TABLE ukey (k text OPTIONS (rowkey 'true') COLLATE "C",
+  n int OPTIONS (column 'd:n')) SERVER hb;
+SELECT * FROM ukey;
+  k  | n  
+-----+----
+ e%  |  1
+ e%x |  2
+ e_x |  3
+ ex  |  4
+ exy |  5
+ eé  |  6
+ eéa |  7
+ é1  |  8
+ é2  |  9
+ ê   | 10
+(10 rows)
+
+SELECT * FROM ukey WHERE k LIKE 'e\%%';
+  k  | n 
+-----+---
+ e%  | 1
+ e%x | 2
+(2 rows)
+
+SELECT hb_explain($$SELECT * FROM ukey WHERE k LIKE 'e#_x' ESCAPE '#'$$);
+              hb_explain               
+---------------------------------------
+ Foreign Scan on ukey
+   Filter: (k ~~ 'e\_x'::text)
+   HBase Table: ukey
+   HBase Key Cond: (k ~~ 'e\_x'::text)
+   HBase Get Keys: 1
+   HBase RPCs: 1
+(6 rows)
+
+SELECT * FROM ukey WHERE k LIKE 'e#_x' ESCAPE '#';
+  k  | n 
+-----+---
+ e_x | 3
+(1 row)
+
+SELECT * FROM ukey WHERE k LIKE 'e_';
+ k  | n 
+----+---
+ e% | 1
+ ex | 4
+ eé | 6
+(3 rows)
+
+SELECT hb_explain($$SELECT * FROM ukey WHERE k LIKE 'é%'$$);
+             hb_explain              
+-------------------------------------
+ Foreign Scan on ukey
+   Filter: (k ~~ 'é%'::text)
+   HBase Table: ukey
+   HBase Key Cond: (k ~~ 'é%'::text)
+   HBase Start Row: \xc3\xa9
+   HBase Stop Row: \xc3\xaa
+   HBase RPCs: 2
+(7 rows)
+
+SELECT * FROM ukey WHERE k LIKE 'é%';
+ k  | n 
+----+---
+ é1 | 8
+ é2 | 9
+(2 rows)
+
+SELECT * FROM ukey WHERE k BETWEEN 'e' AND 'é';
+  k  | n 
+-----+---
+ e%  | 1
+ e%x | 2
+ e_x | 3
+ ex  | 4
+ exy | 5
+ eé  | 6
+ eéa | 7
+(7 rows)
+
+-- 0xff has no successor: a\xff% stops at b, \xff% has no stop row
+CREATE FOREIGN TABLE bkey (k bytea OPTIONS (rowkey 'true'),
+  n int OPTIONS (column 'd:n')) SERVER hb;
+SELECT * FROM bkey;
+    k     | n  
+----------+----
+ \x61     |  1
+ \x6100   |  2
+ \x61feff |  3
+ \x61ff   |  4
+ \x61ff00 |  5
+ \x61ffff |  6
+ \x62     |  7
+ \xff     |  8
+ \xff01   |  9
+ \xffff   | 10
+(10 rows)
+
+SELECT hb_explain($$SELECT n FROM bkey WHERE k LIKE '\x61ff25'$$);
+                 hb_explain                 
+--------------------------------------------
+ Foreign Scan on bkey
+   Filter: (k ~~ '\x61ff25'::bytea)
+   HBase Table: bkey
+   HBase Key Cond: (k ~~ '\x61ff25'::bytea)
+   HBase Start Row: a\xff
+   HBase Stop Row: b
+   HBase RPCs: 2
+(7 rows)
+
+SELECT n FROM bkey WHERE k LIKE '\x61ff25';
+ n 
+---
+ 4
+ 5
+ 6
+(3 rows)
+
+SELECT hb_explain($$SELECT n FROM bkey WHERE k LIKE '\x61feff25'$$);
+                  hb_explain                  
+----------------------------------------------
+ Foreign Scan on bkey
+   Filter: (k ~~ '\x61feff25'::bytea)
+   HBase Table: bkey
+   HBase Key Cond: (k ~~ '\x61feff25'::bytea)
+   HBase Start Row: a\xfe\xff
+   HBase Stop Row: a\xff
+   HBase RPCs: 2
+(7 rows)
+
+SELECT hb_explain($$SELECT n FROM bkey WHERE k LIKE '\xff25'$$);
+                hb_explain                
+------------------------------------------
+ Foreign Scan on bkey
+   Filter: (k ~~ '\xff25'::bytea)
+   HBase Table: bkey
+   HBase Key Cond: (k ~~ '\xff25'::bytea)
+   HBase Start Row: \xff
+   HBase RPCs: 2
+(6 rows)
+
+SELECT n FROM bkey WHERE k LIKE '\xff25';
+ n  
+----
+  8
+  9
+ 10
+(3 rows)
+
+SELECT n FROM bkey WHERE k > '\x61ff' AND k <= '\xff';
+ n 
+---
+ 5
+ 6
+ 7
+ 8
+(4 rows)
+
+-- run-time pattern
+SET plan_cache_mode = force_generic_plan;
+PREPARE lk(text) AS SELECT * FROM ukey WHERE k LIKE $1;
+EXPLAIN (COSTS OFF) EXECUTE lk('ex%');
+         QUERY PLAN          
+-----------------------------
+ Foreign Scan on ukey
+   Filter: (k ~~ $1)
+   HBase Table: ukey
+   HBase Key Cond: (k ~~ $1)
+(4 rows)
+
+EXECUTE lk('ex%');
+  k  | n 
+-----+---
+ ex  | 4
+ exy | 5
+(2 rows)
+
+EXECUTE lk('%x');
+  k  | n 
+-----+---
+ e%x | 2
+ e_x | 3
+ ex  | 4
+(3 rows)
+
+EXECUTE lk(NULL);
+ k | n 
+---+---
+(0 rows)
+
+DEALLOCATE lk;
+RESET plan_cache_mode;
+-- ranges and prefixes agree with the local copy (byte order)
+SELECT count(*) AS mismatches FROM
+  (VALUES ('e000990', 'e001010'), ('e0099', 'e01'), ('e', 'e000002'),
+          ('e009999', 'f'), ('a', 'z')) v(lo, hi)
+  WHERE (SELECT count(*) FROM emp_c WHERE id >= lo AND id < hi) <>
+        (SELECT count(*) FROM emp_local WHERE id >= lo COLLATE "C" AND id < hi COLLATE "C");
+ mismatches 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS mismatches FROM (VALUES ('e00999'), ('e0100'), ('e1'), ('e')) v(p)
+  WHERE (SELECT count(*) FROM emp WHERE id LIKE p || '%') <>
+        (SELECT count(*) FROM emp_local WHERE id LIKE p || '%');
+ mismatches 
+------------
+          0
+(1 row)
+
+-- key lists: IN / = ANY fetch the distinct non-NULL keys, batch_size per get,
+-- in key order, clipped to any range on the key
+SELECT hb_explain($$SELECT id, salary FROM emp WHERE id IN ('e000003', 'e000001', 'nope', 'e000003', NULL, '')$$);
+                                   hb_explain                                    
+---------------------------------------------------------------------------------
+ Foreign Scan on emp
+   Filter: (id = ANY ('{e000003,e000001,nope,e000003,NULL,""}'::text[]))
+   HBase Table: emp
+   HBase Key Cond: (id = ANY ('{e000003,e000001,nope,e000003,NULL,""}'::text[]))
+   HBase Get Keys: 3
+   HBase RPCs: 1
+(6 rows)
+
+SELECT id, salary FROM emp WHERE id IN ('e000003', 'e000001', 'nope', 'e000003', NULL, '');
+   id    | salary 
+---------+--------
+ e000001 |  98000
+ e000003 | 187000
+(2 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id = ANY (ARRAY['e000001', 'e000002']) AND id IN ('e000002', 'e000009')$$);
+                                                  hb_explain                                                   
+---------------------------------------------------------------------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: ((id = ANY ('{e000001,e000002}'::text[])) AND (id = ANY ('{e000002,e000009}'::text[])))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY ('{e000001,e000002}'::text[])) AND (id = ANY ('{e000002,e000009}'::text[]))
+         HBase Get Keys: 1
+         HBase RPCs: 1
+(6 rows)
+
+SELECT hb_explain($$SELECT id FROM emp_c WHERE id IN ('e000001', 'e000500', 'e009000') AND id > 'e000100'$$);
+                                          hb_explain                                           
+-----------------------------------------------------------------------------------------------
+ Foreign Scan on emp_c
+   Filter: ((id > 'e000100'::text) AND (id = ANY ('{e000001,e000500,e009000}'::text[])))
+   HBase Table: emp
+   HBase Key Cond: (id > 'e000100'::text) AND (id = ANY ('{e000001,e000500,e009000}'::text[]))
+   HBase Get Keys: 2
+   HBase RPCs: 1
+(6 rows)
+
+SELECT id FROM emp_c WHERE id IN ('e000001', 'e000500', 'e009000') AND id > 'e000100';
+   id    
+---------
+ e000500
+ e009000
+(2 rows)
+
+-- nothing left to fetch: 0 RPCs
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id IN ('a', 'b') AND id = 'c'$$);
+                                hb_explain                                 
+---------------------------------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: ((id = ANY ('{a,b}'::text[])) AND (id = 'c'::text))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY ('{a,b}'::text[])) AND (id = 'c'::text)
+         HBase RPCs: 0
+(5 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id = ANY (NULL::text[])$$);
+                    hb_explain                     
+---------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id = ANY (NULL::text[]))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY (NULL::text[]))
+         HBase RPCs: 0
+(5 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id = ANY ('{}')$$);
+                    hb_explain                     
+---------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id = ANY ('{}'::text[]))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY ('{}'::text[]))
+         HBase RPCs: 0
+(5 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id IN (NULL, '')$$);
+                        hb_explain                        
+----------------------------------------------------------
+   ->  Foreign Scan on emp
+         Filter: (id = ANY ('{NULL,""}'::text[]))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY ('{NULL,""}'::text[]))
+         HBase RPCs: 0
+(5 rows)
+
+-- 1200 keys / 500 per get = 3 RPCs
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id = ANY (ARRAY(SELECT 'e' || lpad(g::text, 6, '0') FROM generate_series(1, 2400, 2) g))$$);
+                       hb_explain                       
+--------------------------------------------------------
+     ->  Function Scan on generate_series g
+   ->  Foreign Scan on emp
+         Filter: (id = ANY ((InitPlan 1).col1))
+         HBase Table: emp
+         HBase Key Cond: (id = ANY ((InitPlan 1).col1))
+         HBase Get Keys: 1200
+         HBase RPCs: 3
+(7 rows)
+
+SELECT count(*), min(id), max(id) FROM emp
+  WHERE id = ANY (ARRAY(SELECT 'e' || lpad(g::text, 6, '0') FROM generate_series(1, 2400, 2) g));
+ count |   min   |   max   
+-------+---------+---------
+  1200 | e000001 | e002399
+(1 row)
+
+-- integer keys, cross-type
+SELECT * FROM ikey WHERE k IN (1, 5, 12, 99);
+ k  | sq  
+----+-----
+  1 |   1
+ 12 | 144
+  5 |  25
+(3 rows)
+
+SELECT * FROM ikey WHERE k = ANY ('{3,4}'::bigint[]);
+ k | sq 
+---+----
+ 3 |  9
+ 4 | 16
+(2 rows)
+
+-- a get still needs a cell in a mapped family (r4 has none, as in a scan)
+CREATE FOREIGN TABLE odd_d (k text OPTIONS (rowkey 'true'),
+  num text OPTIONS (column 'd:num')) SERVER hb OPTIONS (table 'odd');
+SELECT * FROM odd_d WHERE k IN ('r1', 'r4', 'r5');
+ k  |     num      
+----+--------------
+ r1 | 42
+ r5 | not-a-number
+(2 rows)
+
+SELECT * FROM odd_d WHERE k = 'r4';
+ k | num 
+---+-----
+(0 rows)
+
+-- not pushed: NOT IN
+EXPLAIN (COSTS OFF) SELECT id FROM emp WHERE id NOT IN ('e000001', 'e000002');
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Foreign Scan on emp
+   Filter: (id <> ALL ('{e000001,e000002}'::text[]))
+   HBase Table: emp
+(3 rows)
+
+-- run-time lists
+SET plan_cache_mode = force_generic_plan;
+PREPARE ia(text[]) AS SELECT id FROM emp WHERE id = ANY ($1);
+EXPLAIN (COSTS OFF) EXECUTE ia('{e000007,e000008}');
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on emp
+   Filter: (id = ANY ($1))
+   HBase Table: emp
+   HBase Key Cond: (id = ANY ($1))
+(4 rows)
+
+EXECUTE ia('{e000008,e000007}');
+   id    
+---------
+ e000007
+ e000008
+(2 rows)
+
+EXECUTE ia(NULL);
+ id 
+----
+(0 rows)
+
+PREPARE ib(text, text) AS SELECT id FROM emp WHERE id IN ($1, $2);
+EXECUTE ib('e000009', NULL);
+   id    
+---------
+ e000009
+(1 row)
+
+DEALLOCATE ia;
+DEALLOCATE ib;
+RESET plan_cache_mode;
+-- lists agree with the local copy, also when rescanned per outer row
+SELECT count(*) AS mismatches FROM emp_local l
+  WHERE l.id IN ('e000001', 'e000500', 'e009999', 'e010000', 'e004242')
+    AND (SELECT row(f.*) FROM emp f WHERE f.id IN (l.id, 'zz')) IS DISTINCT FROM row(l.*);
+ mismatches 
+------------
+          0
+(1 row)
+
+-- row estimates: the "rows" option is the table size; = / IN give one row
+-- per key, ranges and prefixes default selectivities (no statistics), and
+-- local quals filter what HBase sends
+CREATE FUNCTION hb_rows(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN ' || q LOOP
+    IF l ~ 'Foreign Scan' THEN RETURN substring(l from 'rows=[0-9]+'); END IF;
+  END LOOP;
+END $$;
+SELECT hb_rows(q), q FROM (VALUES
+  ('SELECT * FROM emp'),
+  ('SELECT * FROM emp2'),
+  ('SELECT * FROM emp WHERE salary > 100000'),
+  ('SELECT * FROM emp WHERE id = ''e000001'''),
+  ('SELECT * FROM emp WHERE id = ''e000001'' AND salary > 100000'),
+  ('SELECT * FROM emp WHERE id IN (''a'', ''b'', ''c'')'),
+  ('SELECT * FROM emp WHERE id IN (''a'', ''b'', ''c'') AND id = ''b'''),
+  ('SELECT * FROM emp WHERE id = ANY (ARRAY(SELECT id FROM emp_local))'),
+  ('SELECT * FROM emp_c WHERE id BETWEEN ''e000100'' AND ''e000199'''),
+  ('SELECT * FROM emp_c WHERE id > ''e009000'''),
+  ('SELECT * FROM emp WHERE id LIKE ''e0001%''')) v(q);
+  hb_rows   |                                 q                                  
+------------+--------------------------------------------------------------------
+ rows=10000 | SELECT * FROM emp
+ rows=1000  | SELECT * FROM emp2
+ rows=3333  | SELECT * FROM emp WHERE salary > 100000
+ rows=1     | SELECT * FROM emp WHERE id = 'e000001'
+ rows=1     | SELECT * FROM emp WHERE id = 'e000001' AND salary > 100000
+ rows=3     | SELECT * FROM emp WHERE id IN ('a', 'b', 'c')
+ rows=1     | SELECT * FROM emp WHERE id IN ('a', 'b', 'c') AND id = 'b'
+ rows=10    | SELECT * FROM emp WHERE id = ANY (ARRAY(SELECT id FROM emp_local))
+ rows=5     | SELECT * FROM emp_c WHERE id BETWEEN 'e000100' AND 'e000199'
+ rows=333   | SELECT * FROM emp_c WHERE id > 'e009000'
+ rows=50    | SELECT * FROM emp WHERE id LIKE 'e0001%'
+(11 rows)
+
+-- the planner now sees a key lookup as cheap: it drives the join
+ANALYZE emp_local;
+EXPLAIN (COSTS OFF) SELECT f.id, l.name FROM emp f JOIN emp_local l ON l.id = f.id
+  WHERE f.id = 'e000042';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop
+   ->  Foreign Scan on emp f
+         Filter: (id = 'e000042'::text)
+         HBase Table: emp
+         HBase Key Cond: (id = 'e000042'::text)
+   ->  Index Scan using emp_local_pkey on emp_local l
+         Index Cond: (id = 'e000042'::text)
+(7 rows)
+
+-- rows arrive in key byte order: no Sort where Postgres order is the same
+-- (C collation, bytea), a Sort otherwise (default collation, integers, DESC)
+EXPLAIN (COSTS OFF) SELECT id FROM emp_c ORDER BY id LIMIT 3;
+         QUERY PLAN          
+-----------------------------
+ Limit
+   ->  Foreign Scan on emp_c
+         HBase Table: emp
+(3 rows)
+
+SELECT id FROM emp_c ORDER BY id LIMIT 3;
+   id    
+---------
+ e000001
+ e000002
+ e000003
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM emp_c WHERE id IN ('e000009', 'e000001') ORDER BY id;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Foreign Scan on emp_c
+   Filter: (id = ANY ('{e000009,e000001}'::text[]))
+   HBase Table: emp
+   HBase Key Cond: (id = ANY ('{e000009,e000001}'::text[]))
+(4 rows)
+
+SELECT id FROM emp_c WHERE id IN ('e000009', 'e000001') ORDER BY id;
+   id    
+---------
+ e000001
+ e000009
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM odd_b ORDER BY k;
+      QUERY PLAN       
+-----------------------
+ Foreign Scan on odd_b
+   HBase Table: odd
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM emp ORDER BY id LIMIT 3;
+           QUERY PLAN            
+---------------------------------
+ Limit
+   ->  Sort
+         Sort Key: id
+         ->  Foreign Scan on emp
+               HBase Table: emp
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM ikey ORDER BY k;
+         QUERY PLAN         
+----------------------------
+ Sort
+   Sort Key: k
+   ->  Foreign Scan on ikey
+         HBase Table: ikey
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM emp_c ORDER BY id DESC LIMIT 3;
+              QUERY PLAN               
+---------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: id COLLATE "C" DESC
+         ->  Foreign Scan on emp_c
+               HBase Table: emp
+(5 rows)
+
+-- what gets fetched
+EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM emp;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Foreign Scan on public.emp
+         Output: id, name, dept, joined, salary, bonus
+         HBase Table: emp
+         HBase Columns: info:name
+         HBase Filter: FirstKeyOnlyFilter() AND KeyOnlyFilter()
+         Batch Size: 500
+(8 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id, salary FROM emp;
+               QUERY PLAN               
+----------------------------------------
+ Foreign Scan on public.emp
+   Output: id, salary
+   HBase Table: emp
+   HBase Columns: pay:salary, info:name
+   Batch Size: 500
+(5 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF) SELECT name FROM emp2;
+         QUERY PLAN          
+-----------------------------
+ Foreign Scan on public.emp2
+   Output: name
+   HBase Table: emp
+   HBase Families: info, pay
+   Batch Size: 1000
+(5 rows)
+
+SELECT count(*), count(name), count(salary) FROM emp2;
+ count | count | count 
+-------+-------+-------
+ 10000 | 10000 | 10000
+(1 row)
+
+-- rescans: foreign table on the inner side of a nested loop; the join is on
+-- the row key, so each of the 3 outer rows is 1 get (no full scans)
+ANALYZE emp_local;
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;
+SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT l.id, f.name FROM (SELECT * FROM emp_local WHERE id < 'e000004') l
+  JOIN emp f ON f.id = l.id;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Nested Loop (actual rows=3 loops=1)
+   ->  Seq Scan on emp_local (actual rows=3 loops=1)
+         Filter: (id < 'e000004'::text)
+         Rows Removed by Filter: 9997
+   ->  Foreign Scan on emp f (actual rows=1 loops=3)
+         Filter: (id = emp_local.id)
+         HBase Table: emp
+         HBase Key Cond: (id = emp_local.id)
+         HBase Get Keys: 1
+         HBase RPCs: 3
+(10 rows)
+
+SELECT l.id, f.name FROM (SELECT * FROM emp_local WHERE id < 'e000004') l
+  JOIN emp f ON f.id = l.id ORDER BY 1;
+   id    |  name   
+---------+---------
+ e000001 | zoya_1
+ e000002 | kabir_2
+ e000003 | ravi_3
+(3 rows)
+
+-- same, joined on a non-key column: a full scan per outer row (scanner
+-- reopened on every rescan: 3 x 21 RPCs)
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT l.id, f.id FROM (SELECT * FROM emp_local WHERE id < 'e000004') l
+  JOIN emp f ON f.name = l.name AND f.salary = l.salary;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Nested Loop (actual rows=3 loops=1)
+   Join Filter: ((emp_local.name = f.name) AND (emp_local.salary = f.salary))
+   Rows Removed by Join Filter: 29997
+   ->  Seq Scan on emp_local (actual rows=3 loops=1)
+         Filter: (id < 'e000004'::text)
+         Rows Removed by Filter: 9997
+   ->  Foreign Scan on emp f (actual rows=10000 loops=3)
+         HBase Table: emp
+         HBase RPCs: 63
+(9 rows)
+
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_material;
+RESET enable_indexscan; RESET enable_indexonlyscan; RESET enable_bitmapscan;
+-- joins use the row key like an index: a parameterized path looks up each
+-- outer row's key (orders: 20 rows, 2 NULL keys = no RPC, 4 missing keys)
+CREATE TABLE ord (oid int, emp_id text);
+INSERT INTO ord SELECT g, CASE WHEN g % 7 = 0 THEN NULL
+  WHEN g % 5 = 0 THEN 'zz' || g ELSE 'e' || lpad((g * 37 % 10000 + 1)::text, 6, '0') END
+  FROM generate_series(1, 20) g;
+ANALYZE ord;
+SELECT hb_explain($$SELECT o.oid, e.name FROM ord o JOIN emp e ON e.id = o.emp_id$$);
+                  hb_explain                   
+-----------------------------------------------
+   ->  Seq Scan on ord o
+         ->  Foreign Scan on emp e
+               Filter: (id = o.emp_id)
+               HBase Table: emp
+               HBase Key Cond: (id = o.emp_id)
+               HBase Get Keys: 1
+               HBase RPCs: 18
+(7 rows)
+
+SELECT count(*), count(e.name) FROM ord o JOIN emp e ON e.id = o.emp_id;
+ count | count 
+-------+-------
+    14 |    14
+(1 row)
+
+SELECT count(*), count(e.name) FROM ord o LEFT JOIN emp e ON e.id = o.emp_id;
+ count | count 
+-------+-------
+    20 |    14
+(1 row)
+
+SELECT count(*) AS mismatches FROM (
+  (SELECT o.oid, e.* FROM ord o LEFT JOIN emp e ON e.id = o.emp_id EXCEPT
+   SELECT o.oid, e.* FROM ord o LEFT JOIN emp_local e ON e.id = o.emp_id)
+  UNION ALL
+  (SELECT o.oid, e.* FROM ord o LEFT JOIN emp_local e ON e.id = o.emp_id EXCEPT
+   SELECT o.oid, e.* FROM ord o LEFT JOIN emp e ON e.id = o.emp_id)) x;
+ mismatches 
+------------
+          0
+(1 row)
+
+-- join clauses that are not plain equivalences, IN, a semi join, LATERAL
+SELECT hb_explain($$SELECT count(*) FROM ord o JOIN emp e ON e.id = 'e' || lpad(o.oid::text, 6, '0')$$);
+                                      hb_explain                                       
+---------------------------------------------------------------------------------------
+         ->  Seq Scan on ord o
+         ->  Foreign Scan on emp e
+               Filter: (id = ('e'::text || lpad((o.oid)::text, 6, '0'::text)))
+               HBase Table: emp
+               HBase Key Cond: (id = ('e'::text || lpad((o.oid)::text, 6, '0'::text)))
+               HBase Get Keys: 1
+               HBase RPCs: 20
+(7 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM ord o JOIN emp e ON e.id = ANY (ARRAY[o.emp_id, 'e000001'])$$);
+                                 hb_explain                                  
+-----------------------------------------------------------------------------
+         ->  Seq Scan on ord o
+         ->  Foreign Scan on emp e
+               Filter: (id = ANY (ARRAY[o.emp_id, 'e000001'::text]))
+               HBase Table: emp
+               HBase Key Cond: (id = ANY (ARRAY[o.emp_id, 'e000001'::text]))
+               HBase Get Keys: 2
+               HBase RPCs: 20
+(7 rows)
+
+SELECT hb_explain($$SELECT count(*) FROM emp WHERE id IN (SELECT emp_id FROM ord)$$);
+                   hb_explain                    
+-------------------------------------------------
+               ->  Seq Scan on ord
+         ->  Foreign Scan on emp
+               Filter: (id = ord.emp_id)
+               HBase Table: emp
+               HBase Key Cond: (id = ord.emp_id)
+               HBase Get Keys: 1
+               HBase RPCs: 18
+(7 rows)
+
+SELECT count(*) FROM emp WHERE id IN (SELECT emp_id FROM ord);
+ count 
+-------
+    14
+(1 row)
+
+SELECT hb_explain($$SELECT o.oid, x.salary FROM ord o,
+  LATERAL (SELECT salary FROM emp WHERE id = o.emp_id OFFSET 0) x WHERE o.oid <= 4$$);
+               hb_explain                
+-----------------------------------------
+   ->  Seq Scan on ord o
+         Filter: (oid <= 4)
+         Rows Removed by Filter: 16
+   ->  Foreign Scan on emp
+         Filter: (id = o.emp_id)
+         HBase Table: emp
+         HBase Key Cond: (id = o.emp_id)
+         HBase Get Keys: 1
+         HBase RPCs: 4
+(9 rows)
+
+SELECT o.oid, x.salary FROM ord o,
+  LATERAL (SELECT salary FROM emp WHERE id = o.emp_id OFFSET 0) x WHERE o.oid <= 4;
+ oid | salary 
+-----+--------
+   1 | 107000
+   2 | 200000
+   3 | 217000
+   4 |  58000
+(4 rows)
+
+-- a range per outer row (C collation): one small scan each
+SELECT hb_explain($$SELECT count(*) FROM ord o JOIN emp_c e
+  ON e.id >= o.emp_id AND e.id < o.emp_id || '5' WHERE o.oid < 3$$);
+                                    hb_explain                                     
+-----------------------------------------------------------------------------------
+         ->  Seq Scan on ord o
+               Filter: (oid < 3)
+               Rows Removed by Filter: 18
+         ->  Foreign Scan on emp_c e
+               Filter: ((id >= o.emp_id) AND (id < (o.emp_id || '5'::text)))
+               HBase Table: emp
+               HBase Key Cond: (id >= o.emp_id) AND (id < (o.emp_id || '5'::text))
+               HBase Start Row: e000075
+               HBase Stop Row: e0000755
+               HBase RPCs: 4
+(10 rows)
+
+SELECT count(*) FROM ord o JOIN emp_c e ON e.id >= o.emp_id AND e.id < o.emp_id || '5'
+  WHERE o.oid < 3;
+ count 
+-------
+     2
+(1 row)
+
+-- integer key, bigint outer column
+SET enable_hashjoin = off; SET enable_mergejoin = off;
+CREATE TABLE nums AS SELECT g::bigint AS b FROM generate_series(10, 14) g;
+SELECT hb_explain($$SELECT b, sq FROM nums JOIN ikey ON k = b$$);
+              hb_explain              
+--------------------------------------
+   ->  Seq Scan on nums
+   ->  Foreign Scan on ikey
+         Filter: (k = nums.b)
+         HBase Table: ikey
+         HBase Key Cond: (k = nums.b)
+         HBase Get Keys: 1
+         HBase RPCs: 5
+(7 rows)
+
+SELECT b, sq FROM nums JOIN ikey ON k = b;
+ b  | sq  
+----+-----
+ 10 | 100
+ 11 | 121
+ 12 | 144
+(3 rows)
+
+RESET enable_hashjoin; RESET enable_mergejoin;
+-- 10000 outer rows: one full scan into a hash join beats 10000 gets
+EXPLAIN (COSTS OFF) SELECT count(*) FROM emp_local l JOIN emp e ON e.id = l.id;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   ->  Hash Join
+         Hash Cond: (e.id = l.id)
+         ->  Foreign Scan on emp e
+               HBase Table: emp
+         ->  Hash
+               ->  Seq Scan on emp_local l
+(7 rows)
+
+DROP TABLE ord, nums;
+-- self join over two concurrent scanners
+SELECT count(*) FROM emp a JOIN emp b ON a.id = b.id AND a.salary = b.salary;
+ count 
+-------
+ 10000
+(1 row)
+
+-- edge cases: unicode, empty string, binary, missing cells, bad data
+CREATE FOREIGN TABLE odd (
+  k   text OPTIONS (rowkey 'true'),
+  txt text OPTIONS (column 'd:txt'),
+  num int  OPTIONS (column 'd:num'),
+  bin bytea OPTIONS (column 'd:bin')
+) SERVER hb;
+SELECT k, txt, txt = '' AS empty, bin FROM odd WHERE k <> 'r5' ORDER BY k;
+ k  |    txt     | empty |    bin     
+----+------------+-------+------------
+ r1 | नमस्ते दुनिया | f     | 
+ r2 |            | t     | 
+ r3 |            |       | \x000102ff
+(3 rows)
+
+SELECT * FROM odd;                -- r5 has num = 'not-a-number'
+ERROR:  invalid input syntax for type integer: "not-a-number"
+CONTEXT:  HBase table "odd", row key "r5", column "num"
+CREATE FOREIGN TABLE odd_txt (k text OPTIONS (rowkey 'true'),
+  bin text OPTIONS (column 'd:bin')) SERVER hb OPTIONS (table 'odd');
+SELECT * FROM odd_txt;            -- zero byte in a text column
+ERROR:  HBase value contains a zero byte
+HINT:  Declare the column as bytea to read binary data.
+CONTEXT:  HBase table "odd", row key "r3", column "bin"
+-- r4 only has family x: in the relation only if x is mapped
+CREATE FOREIGN TABLE odd_x (k text OPTIONS (rowkey 'true'),
+  num text OPTIONS (column 'd:num'), o text OPTIONS (column 'x:other'))
+  SERVER hb OPTIONS (table 'odd');
+SELECT k, num, o FROM odd_x ORDER BY k;
+ k  |     num      |          o           
+----+--------------+----------------------
+ r1 | 42           | 
+ r2 | -7           | 
+ r3 | 0            | 
+ r4 |              | only unmapped family
+ r5 | not-a-number | 
+(5 rows)
+
+SELECT count(*) FROM odd;
+ count 
+-------
+     4
+(1 row)
+
+SELECT count(*) FROM odd_x;
+ count 
+-------
+     5
+(1 row)
+
+-- mapping errors
+CREATE FOREIGN TABLE nomap (k text OPTIONS (rowkey 'true'), v text) SERVER hb;
+SELECT * FROM nomap;
+ERROR:  column "v" of foreign table "nomap" has no HBase mapping
+HINT:  Set OPTIONS (column 'family:qualifier') or (rowkey 'true') on it, or a default "family" on the table.
+CREATE FOREIGN TABLE twokeys (a text OPTIONS (rowkey 'true'),
+  b text OPTIONS (rowkey 'true')) SERVER hb;
+SELECT * FROM twokeys;
+ERROR:  foreign table "twokeys" has more than one rowkey column
+CREATE FOREIGN TABLE nosuch (k text OPTIONS (rowkey 'true')) SERVER hb;
+SELECT * FROM nosuch;
+ERROR:  hbase_fdw: TableNotFoundException: nosuch
+DETAIL:  HBase raised IOError.
+CREATE SERVER dead FOREIGN DATA WRAPPER hbase_fdw OPTIONS (port '1');
+CREATE FOREIGN TABLE deadt (k text OPTIONS (rowkey 'true')) SERVER dead;
+SELECT * FROM deadt;
+ERROR:  hbase_fdw: could not connect to HBase thrift server (localhost:1): Connection refused
+-- connection still fine after errors
+SELECT count(*) FROM emp;
+ count 
+-------
+ 10000
+(1 row)
+
+DROP TABLE emp_local;
+DROP FUNCTION hb_explain(text);
+DROP FUNCTION hb_rows(text);
+DROP EXTENSION hbase_fdw CASCADE;
+NOTICE:  drop cascades to 18 other objects
+DETAIL:  drop cascades to server hb
+drop cascades to foreign table emp
+drop cascades to foreign table emp2
+drop cascades to foreign table emp_vc
+drop cascades to foreign table odd_b
+drop cascades to foreign table ikey
+drop cascades to foreign table emp_c
+drop cascades to foreign table ukey
+drop cascades to foreign table bkey
+drop cascades to foreign table odd_d
+drop cascades to foreign table odd
+drop cascades to foreign table odd_txt
+drop cascades to foreign table odd_x
+drop cascades to foreign table nomap
+drop cascades to foreign table twokeys
+drop cascades to foreign table nosuch
+drop cascades to server dead
+drop cascades to foreign table deadt

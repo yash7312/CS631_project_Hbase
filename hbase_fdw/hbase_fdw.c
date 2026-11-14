@@ -1,0 +1,1577 @@
+/*
+ * hbase_fdw.c
+ *    Foreign data wrapper that reads HBase tables through the HBase Thrift1
+ *    gateway. Week 1 scope: read-only full scans with column projection.
+ *
+ *  CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
+ *      OPTIONS (host 'localhost', port '9090');
+ *  CREATE FOREIGN TABLE emp (
+ *      id     text OPTIONS (rowkey 'true'),
+ *      name   text OPTIONS (column 'info:name'),
+ *      salary int  OPTIONS (column 'pay:salary')
+ *  ) SERVER hb OPTIONS (table 'emp');
+ *
+ * Assumptions (as with file_fdw): the user declares the schema; HBase values
+ * are bytes holding the text form of the value (what `hbase shell` put
+ * stores), converted with the column type's input function. bytea columns
+ * get the raw bytes. A missing cell is NULL. We read the latest version only.
+ */
+#include "postgres.h"
+
+#include <math.h>
+
+#include "access/htup_details.h"
+#include "access/reloptions.h"
+#include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
+#include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#endif
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "funcapi.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/pg_locale.h"
+#include "utils/rel.h"
+#include "utils/ruleutils.h"
+#include "utils/selfuncs.h"
+#include "utils/typcache.h"
+
+#include "hbase_thrift.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(hbase_fdw_handler);
+PG_FUNCTION_INFO_V1(hbase_fdw_validator);
+
+#define DEF_PORT	9090
+#define DEF_TMO		30			/* seconds */
+#define DEF_BATCH	1000
+#define DEF_ROWS	1000
+
+/*
+ * Planner costs, in seq_page_cost units, calibrated on a local standalone
+ * HBase (Phase 6 timings): a Thrift round trip took ~0.65 ms, a scanned row
+ * ~1 us, so a round trip is worth ~700 rows. HB_RPC_COST is set a bit above
+ * that (15 vs 0.015 per row) so the planner switches from a nested loop of
+ * gets to a hash join over a full scan where the measured switch is (~25
+ * outer rows on 10k rows): core's own hash-join CPU costs are not wall-clock
+ * calibrated.
+ */
+#define HB_CONNECT_COST	10.0
+#define HB_RPC_COST		15.0
+#define HB_ROW_COST		0.005
+
+typedef struct Opt
+{
+	const char *name;
+	Oid			cat;
+} Opt;
+
+static const Opt opts[] = {
+	{"host", ForeignServerRelationId},
+	{"port", ForeignServerRelationId},
+	{"timeout", ForeignServerRelationId},
+	{"table", ForeignTableRelationId},
+	{"family", ForeignTableRelationId},
+	{"batch_size", ForeignTableRelationId},
+	{"rows", ForeignTableRelationId},
+	{"rowkey", AttributeRelationId},
+	{"column", AttributeRelationId},
+	{NULL, InvalidOid}
+};
+
+typedef struct HbOpts
+{
+	char	   *host;
+	int			port;
+	int			tmo;
+	char	   *table;
+	char	   *family;			/* default family for unmapped columns */
+	int			batch;
+	double		rows;
+} HbOpts;
+
+/* what the planner works out for one foreign rel, in rel->fdw_private */
+typedef struct HbRelInfo
+{
+	HbOpts		o;
+	Bitmapset  *used;			/* attnos needed: output + local quals */
+	AttrNumber	katt;			/* rowkey column, InvalidAttrNumber if none */
+} HbRelInfo;
+
+/* one fetched attribute */
+typedef struct Col
+{
+	AttrNumber	att;			/* 1-based */
+	char	   *spec;			/* "cf:q", NULL for the row key */
+	int			len;
+	Oid			typ;
+	FmgrInfo	in;
+	Oid			ioparam;
+	int32		typmod;
+} Col;
+
+/* key conditions besides the btree strategies <, <=, =, >=, > */
+#define KC_PREFIX	(BTMaxStrategyNumber + 1)	/* starts_with(key, value) */
+#define KC_LIKE		(BTMaxStrategyNumber + 2)	/* key LIKE value */
+#define KC_IN		(BTMaxStrategyNumber + 3)	/* key = ANY (array value) */
+
+/* a row-key condition pushed to HBase: rowkey <op> value */
+typedef struct KeyCond
+{
+	ExprState  *x;				/* the value, evaluated at scan open */
+	int			op;				/* btree strategy, KC_PREFIX or KC_LIKE */
+	bool		raw;			/* text/bytea: key is the datum's bytes */
+	bool		text;			/* the value is text (LIKE: multibyte chars) */
+	FmgrInfo	out;			/* otherwise: its output function */
+	/* KC_IN: the value is an array of these; raw/text/out refer to them */
+	Oid			elem;
+	int16		elen;
+	bool		ebyval;
+	char		ealign;
+} KeyCond;
+
+typedef struct HbState
+{
+	HbOpts		o;
+	Col		   *cols;
+	int			ncols;
+	char	  **hcols;			/* distinct HBase columns we ask for */
+	int			nh;
+	bool		keyonly;
+	bool		byqual;		/* qualifier-level projection */
+	int			nq;			/* needed non-key columns */
+
+	KeyCond    *kc;
+	int			nk;
+	char	   *kname;			/* rowkey column name, for EXPLAIN */
+	MemoryContext kcxt;			/* holds the current bounds */
+	char	   *start,			/* [start, stop) of the last scan, NULL = open */
+			   *stop;
+	int			startlen,
+				stoplen;
+	bool		get;			/* = or IN: fetch keys[] instead of scanning */
+	HbKey	   *keys;			/* sorted, distinct, inside [start, stop) */
+	int			nkeys,
+				kpos;			/* next key to fetch */
+
+	HbConn	   *conn;
+	int32		sid;
+	bool		begun;			/* bounds set for this (re)scan */
+	bool		open;			/* HBase scanner open */
+	bool		eof;
+
+	MemoryContext bcxt;			/* holds the current batch */
+	HbRow	   *rows;
+	int			n,
+				pos;
+	long		nrpc;			/* scannerGetList + getRowsWithColumns calls */
+
+	/* for error context */
+	HbRow	   *cur;
+	Col		   *ccol;
+	Relation	rel;
+} HbState;
+
+/* ---------- options ---------- */
+
+static int
+int_opt(DefElem *d, int lo)
+{
+	char	   *s = defGetString(d),
+			   *e;
+	long		v;
+
+	errno = 0;
+	v = strtol(s, &e, 10);
+	if (errno || *e || e == s || v < lo || v > INT_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				 errmsg("invalid value for option \"%s\": \"%s\"", d->defname, s),
+				 errhint("Expected an integer >= %d.", lo)));
+	return (int) v;
+}
+
+static void
+check_spec(const char *s)
+{
+	const char *c = strchr(s, ':');
+
+	if (!c || c == s || c[1] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				 errmsg("invalid HBase column \"%s\"", s),
+				 errhint("Use \"family:qualifier\".")));
+}
+
+Datum
+hbase_fdw_validator(PG_FUNCTION_ARGS)
+{
+	List	   *l = untransformRelOptions(PG_GETARG_DATUM(0));
+	Oid			cat = PG_GETARG_OID(1);
+	ListCell   *lc;
+
+	foreach(lc, l)
+	{
+		DefElem    *d = lfirst(lc);
+		const Opt  *o;
+
+		for (o = opts; o->name; o++)
+			if (o->cat == cat && strcmp(o->name, d->defname) == 0)
+				break;
+		if (!o->name)
+		{
+			StringInfoData b;
+
+			initStringInfo(&b);
+			for (o = opts; o->name; o++)
+				if (o->cat == cat)
+					appendStringInfo(&b, "%s%s", b.len ? ", " : "", o->name);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", d->defname),
+					 b.len ? errhint("Valid options in this context are: %s", b.data)
+					 : errhint("There are no valid options in this context.")));
+		}
+
+		if (strcmp(d->defname, "port") == 0)
+		{
+			if (int_opt(d, 1) > 65535)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+						 errmsg("port must be between 1 and 65535")));
+		}
+		else if (strcmp(d->defname, "timeout") == 0)
+			int_opt(d, 0);
+		else if (strcmp(d->defname, "batch_size") == 0 ||
+				 strcmp(d->defname, "rows") == 0)
+			int_opt(d, 1);
+		else if (strcmp(d->defname, "rowkey") == 0)
+			(void) defGetBoolean(d);
+		else if (strcmp(d->defname, "column") == 0)
+			check_spec(defGetString(d));
+		else if (strcmp(d->defname, "family") == 0 &&
+				 (strchr(defGetString(d), ':') || !*defGetString(d)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid HBase family \"%s\"", defGetString(d))));
+	}
+	PG_RETURN_VOID();
+}
+
+static void
+get_opts(Oid relid, HbOpts *o)
+{
+	ForeignTable *ft = GetForeignTable(relid);
+	ForeignServer *fs = GetForeignServer(ft->serverid);
+	List	   *l = list_concat(list_copy(fs->options), ft->options);
+	ListCell   *lc;
+
+	memset(o, 0, sizeof(*o));
+	o->host = "localhost";
+	o->port = DEF_PORT;
+	o->tmo = DEF_TMO;
+	o->batch = DEF_BATCH;
+	o->rows = DEF_ROWS;
+
+	foreach(lc, l)
+	{
+		DefElem    *d = lfirst(lc);
+
+		if (strcmp(d->defname, "host") == 0)
+			o->host = defGetString(d);
+		else if (strcmp(d->defname, "port") == 0)
+			o->port = int_opt(d, 1);
+		else if (strcmp(d->defname, "timeout") == 0)
+			o->tmo = int_opt(d, 0);
+		else if (strcmp(d->defname, "table") == 0)
+			o->table = defGetString(d);
+		else if (strcmp(d->defname, "family") == 0)
+			o->family = defGetString(d);
+		else if (strcmp(d->defname, "batch_size") == 0)
+			o->batch = int_opt(d, 1);
+		else if (strcmp(d->defname, "rows") == 0)
+			o->rows = int_opt(d, 1);
+	}
+	if (!o->table)
+		o->table = get_rel_name(relid);
+}
+
+/*
+ * HBase column for attribute att: NULL means it is the row key.
+ * Unmapped columns fall back to "<family>:<column name>".
+ */
+static char *
+att_spec(Oid relid, AttrNumber att, const char *colname, const HbOpts *o)
+{
+	ListCell   *lc;
+	char	   *spec = NULL;
+
+	foreach(lc, GetForeignColumnOptions(relid, att))
+	{
+		DefElem    *d = lfirst(lc);
+
+		if (strcmp(d->defname, "rowkey") == 0 && defGetBoolean(d))
+			return NULL;
+		if (strcmp(d->defname, "column") == 0)
+			spec = defGetString(d);
+	}
+	if (spec)
+		return spec;
+	if (o->family)
+		return psprintf("%s:%s", o->family, colname);
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+			 errmsg("column \"%s\" of foreign table \"%s\" has no HBase mapping",
+					colname, get_rel_name(relid)),
+			 errhint("Set OPTIONS (column 'family:qualifier') or (rowkey 'true') on it, "
+					 "or a default \"family\" on the table.")));
+	return NULL;				/* keep compiler quiet */
+}
+
+/* ---------- planning ---------- */
+
+/* attno of the rowkey column, InvalidAttrNumber if there is none */
+static AttrNumber
+rowkey_att(Oid relid)
+{
+	Relation	r = table_open(relid, NoLock);
+	TupleDesc	td = RelationGetDescr(r);
+	AttrNumber	k = InvalidAttrNumber;
+	int			i;
+
+	for (i = 0; i < td->natts && k == InvalidAttrNumber; i++)
+	{
+		ListCell   *lc;
+
+		if (TupleDescAttr(td, i)->attisdropped)
+			continue;
+		foreach(lc, GetForeignColumnOptions(relid, i + 1))
+		{
+			DefElem    *d = lfirst(lc);
+
+			if (strcmp(d->defname, "rowkey") == 0 && defGetBoolean(d))
+				k = i + 1;
+		}
+	}
+	table_close(r, NoLock);
+	return k;
+}
+
+/* is n (under binary-compatible casts like varchar -> text) the rowkey? */
+static bool
+is_key_var(Node *n, Index varno, AttrNumber katt)
+{
+	while (n && IsA(n, RelabelType))
+		n = (Node *) ((RelabelType *) n)->arg;
+	return n && IsA(n, Var) &&
+		((Var *) n)->varno == varno &&
+		((Var *) n)->varattno == katt &&
+		((Var *) n)->varlevelsup == 0;
+}
+
+/* does collation coll sort like memcmp? */
+static bool
+coll_is_c(Oid coll)
+{
+	if (!OidIsValid(coll))
+		return false;
+#if PG_VERSION_NUM >= 180000
+	return pg_newlocale_from_collation(coll)->collate_is_c;
+#else
+	return lc_collate_is_c(coll);
+#endif
+}
+
+/*
+ * How HBase can answer "rowkey fn value" (keyleft) or "value fn rowkey":
+ * returns a btree strategy, KC_PREFIX, KC_LIKE, or 0 for "it can't". HBase
+ * orders row keys as unsigned bytes. Equality, LIKE and prefixes agree with
+ * that under any deterministic collation (a case-insensitive ICU collation
+ * calls 'A' = 'a'). <, <=, >, >= agree only under a C collation, for bytea,
+ * and for the text_pattern_ops operators (~<~ etc.), which use memcmp.
+ * Integer keys get = only: their text form does not sort numerically
+ * ("10" < "9"). For = we assume canonical text ("42", not "042" or "+42").
+ */
+static int
+key_strategy(Oid fn, Oid coll, bool keyleft)
+{
+	int			s;
+
+	switch (fn)
+	{
+		case F_TEXT_LT:
+		case F_TEXT_LE:
+		case F_TEXT_GE:
+		case F_TEXT_GT:
+			if (!coll_is_c(coll))
+				return 0;
+			break;
+		case F_TEXTEQ:
+		case F_TEXTLIKE:
+		case F_STARTS_WITH:
+			if (OidIsValid(coll) && !get_collation_isdeterministic(coll))
+				return 0;
+			break;
+	}
+
+	switch (fn)
+	{
+		case F_TEXTEQ:
+		case F_BYTEAEQ:
+		case F_INT2EQ:
+		case F_INT4EQ:
+		case F_INT8EQ:
+		case F_INT24EQ:
+		case F_INT42EQ:
+		case F_INT28EQ:
+		case F_INT82EQ:
+		case F_INT48EQ:
+		case F_INT84EQ:
+			return BTEqualStrategyNumber;
+		case F_TEXT_LT:
+		case F_BYTEALT:
+		case F_TEXT_PATTERN_LT:
+			s = BTLessStrategyNumber;
+			break;
+		case F_TEXT_LE:
+		case F_BYTEALE:
+		case F_TEXT_PATTERN_LE:
+			s = BTLessEqualStrategyNumber;
+			break;
+		case F_TEXT_GE:
+		case F_BYTEAGE:
+		case F_TEXT_PATTERN_GE:
+			s = BTGreaterEqualStrategyNumber;
+			break;
+		case F_TEXT_GT:
+		case F_BYTEAGT:
+		case F_TEXT_PATTERN_GT:
+			s = BTGreaterStrategyNumber;
+			break;
+		case F_TEXTLIKE:
+		case F_BYTEALIKE:
+			/* "value LIKE key" constrains nothing */
+			return keyleft ? KC_LIKE : 0;
+		case F_STARTS_WITH:
+			return keyleft ? KC_PREFIX : 0;
+		default:
+			return 0;
+	}
+	/* "value < key" is "key > value" */
+	return keyleft ? s : BTMaxStrategyNumber + 1 - s;
+}
+
+/*
+ * The fixed prefix of LIKE pattern p: the bytes before the first unescaped
+ * % or _ (backslash is the escape; LIKE ... ESCAPE arrives rewritten to it).
+ * Copied to *out; *exact says the pattern has no wildcard at all.
+ */
+static int
+like_prefix(const char *p, int len, bool text, char *out, bool *exact)
+{
+	int			n = 0,
+				i = 0;
+
+	while (i < len && p[i] != '%' && p[i] != '_')
+	{
+		int			l;
+
+		if (p[i] == '\\' && ++i == len)
+			break;				/* trailing escape: LIKE itself will complain */
+		l = text ? pg_mblen(p + i) : 1;
+		l = Min(l, len - i);
+		memcpy(out + n, p + i, l);
+		n += l;
+		i += l;
+	}
+	*exact = (i == len);
+	return n;
+}
+
+/*
+ * Is n a value fixed for one scan of rel? No Vars of rel itself, nothing
+ * volatile, no SubPlans. Vars of other rels are fine: they come from the
+ * outer side of a nested loop (a join clause on a parameterized path, or a
+ * LATERAL reference) and become nestloop Params in fdw_exprs, set before
+ * every rescan.
+ */
+static bool
+scan_const(Node *n, Index relid)
+{
+	List	   *vars;
+	ListCell   *lc;
+
+	if (contain_volatile_functions(n) || contain_subplans(n))
+		return false;
+	vars = pull_var_clause(n, PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = lfirst(lc);
+
+		/* a PlaceHolderVar may be computed at our level: keep it simple */
+		if (!IsA(v, Var) || (v->varno == relid && v->varlevelsup == 0))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Can HBase answer ri from its row-key order? rowkey <op> value for =, <,
+ * <=, >, >= (so BETWEEN too), LIKE, starts_with/^@ and IN / = ANY (array),
+ * where value is anything fixed for one scan (see scan_const). Sets *val
+ * and the strategy *op.
+ */
+static bool
+key_cond(RestrictInfo *ri, Index relid, AttrNumber katt, Node **val, int *op)
+{
+	Node	   *c = (Node *) ri->clause;
+	List	   *args;
+	Oid			fn,
+				coll;
+	bool		keyleft;
+
+	if (ri->pseudoconstant)
+		return false;
+	if (IsA(c, ScalarArrayOpExpr))
+	{
+		/* k IN (...), k = ANY (array): a set of point lookups */
+		ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) c;
+
+		*val = lsecond(sa->args);
+		*op = KC_IN;
+		return sa->useOr && is_key_var(linitial(sa->args), relid, katt) &&
+			key_strategy(get_opcode(sa->opno), sa->inputcollid, true) ==
+			BTEqualStrategyNumber && scan_const(*val, relid);
+	}
+	if (IsA(c, OpExpr))
+	{
+		args = ((OpExpr *) c)->args;
+		fn = get_opcode(((OpExpr *) c)->opno);
+		coll = ((OpExpr *) c)->inputcollid;
+	}
+	else if (IsA(c, FuncExpr))
+	{
+		/* starts_with(k, 'x') and friends, written as functions */
+		args = ((FuncExpr *) c)->args;
+		fn = ((FuncExpr *) c)->funcid;
+		coll = ((FuncExpr *) c)->inputcollid;
+	}
+	else
+		return false;
+	if (list_length(args) != 2)
+		return false;
+	if ((keyleft = is_key_var(linitial(args), relid, katt)))
+		*val = lsecond(args);
+	else if (is_key_var(lsecond(args), relid, katt))
+		*val = linitial(args);
+	else
+		return false;
+	if (!(*op = key_strategy(fn, coll, keyleft)) || !scan_const(*val, relid))
+		return false;
+
+	/* a constant pattern without a fixed prefix narrows nothing */
+	if (*op == KC_LIKE && IsA(*val, Const) && !((Const *) *val)->constisnull)
+	{
+		struct varlena *v = PG_DETOAST_DATUM_PACKED(((Const *) *val)->constvalue);
+		bool		exact;
+		char	   *buf = palloc(VARSIZE_ANY_EXHDR(v) + 1);
+
+		if (like_prefix(VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v),
+						exprType(*val) != BYTEAOID, buf, &exact) == 0 && !exact)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Pick the quals HBase can answer (see key_cond). The values go to *exprs,
+ * which setrefs keeps up to date for us (and turns outer Vars into nestloop
+ * Params), and the matching strategies to *ops. Every qual is still
+ * rechecked locally, so pushing one down can only save work, never change
+ * the result. The RestrictInfos pushed go to *ris (if not NULL).
+ */
+static void
+key_conds(RelOptInfo *rel, AttrNumber katt, List *clauses, List **exprs,
+		  List **ops, List **ris)
+{
+	ListCell   *lc;
+
+	if (katt == InvalidAttrNumber)
+		return;
+	foreach(lc, clauses)
+	{
+		Node	   *val;
+		int			op;
+
+		if (!key_cond(lfirst(lc), rel->relid, katt, &val, &op))
+			continue;
+		*exprs = lappend(*exprs, val);
+		*ops = lappend_int(*ops, op);
+		if (ris)
+			*ris = lappend(*ris, lfirst(lc));
+	}
+}
+
+/*
+ * Estimate a scan with quals clauses. HBase sends what the pushed key
+ * conditions select: for = / IN at most one row per key (row keys are
+ * unique), for ranges and prefixes a share of the table, guessed by the
+ * usual selectivity functions (there are no statistics, so these are
+ * defaults). The quals that stay local then filter that. The "rows" option
+ * is the table size. Returns the output rows; *fetched is what HBase sends,
+ * *get whether it is fetched by key.
+ */
+static double
+estimate(PlannerInfo *root, RelOptInfo *rel, HbRelInfo *ri, List *clauses,
+		 double *fetched, bool *get)
+{
+	List	   *kexprs = NIL,
+			   *kops = NIL,
+			   *kris = NIL;
+	ListCell   *lc,
+			   *lo;
+	double		nkeys = -1;		/* size of the key set, -1 = none */
+
+	key_conds(rel, ri->katt, clauses, &kexprs, &kops, &kris);
+	forboth(lc, kexprs, lo, kops)
+	{
+		double		n;
+
+		if (lfirst_int(lo) == BTEqualStrategyNumber)
+			n = 1;
+		else if (lfirst_int(lo) == KC_IN)
+#if PG_VERSION_NUM >= 170000
+			n = estimate_array_length(root, lfirst(lc));
+#else
+			n = estimate_array_length(lfirst(lc));
+#endif
+		else
+			continue;
+		nkeys = nkeys < 0 ? n : Min(nkeys, n);	/* key sets intersect */
+	}
+
+	*get = (nkeys >= 0);
+	if (*get)
+		*fetched = Min(nkeys, ri->o.rows);
+	else
+		*fetched = ri->o.rows *
+			clauselist_selectivity(root, kris, rel->relid, JOIN_INNER, NULL);
+	*fetched = clamp_row_est(*fetched);
+
+	return clamp_row_est(*fetched *
+						 clauselist_selectivity(root,
+												list_difference_ptr(clauses, kris),
+												rel->relid, JOIN_INNER, NULL));
+}
+
+static void
+hbGetForeignRelSize(PlannerInfo *root, RelOptInfo *rel, Oid relid)
+{
+	HbRelInfo  *ri = palloc0(sizeof(HbRelInfo));
+	ListCell   *lc;
+	double		fetched;
+	bool		get;
+
+	get_opts(relid, &ri->o);
+	rel->fdw_private = ri;
+	rel->tuples = ri->o.rows;
+
+	/* columns the query needs: output + local quals */
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &ri->used);
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *r = lfirst(lc);
+
+		pull_varattnos((Node *) r->clause, rel->relid, &ri->used);
+	}
+
+	ri->katt = rowkey_att(relid);
+	rel->rows = estimate(root, rel, ri, rel->baserestrictinfo, &fetched, &get);
+}
+
+/*
+ * HBase returns rows in row-key byte order (a scan does; a get asks for its
+ * keys sorted). Postgres can use that for ORDER BY or a merge join when its
+ * own order is the same: bytea, or text/varchar under a C collation. Returns
+ * NIL otherwise, or if no query clause cares about this order.
+ */
+static List *
+key_pathkeys(PlannerInfo *root, RelOptInfo *rel, Oid relid, AttrNumber katt)
+{
+	Oid			typ,
+				coll;
+	int32		typmod;
+	Expr	   *v;
+
+	if (katt == InvalidAttrNumber)
+		return NIL;
+	get_atttypetypmodcoll(relid, katt, &typ, &typmod, &coll);
+	if (typ != BYTEAOID &&
+		!((typ == TEXTOID || typ == VARCHAROID) && coll_is_c(coll)))
+		return NIL;
+	v = (Expr *) makeVar(rel->relid, katt, typ, typmod, coll, 0);
+	return build_expression_pathkey(root, v,
+									lookup_type_cache(typ, TYPECACHE_LT_OPR)->lt_opr,
+									rel->relids, false);
+}
+
+/*
+ * Add a path with quals clauses, parameterized by required_outer (NULL: a
+ * plain path). Cost: the first round trip comes before the first row (and
+ * connecting, once per plan node: a rescan keeps the connection, so a
+ * parameterized path, which is there to be rescanned, doesn't charge it);
+ * then one round trip per batch (a scan also opens, ends on an empty batch
+ * and closes; a get fetches batch_size keys per call), shipping each row,
+ * and the local quals on each row.
+ */
+static void
+add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
+			Relids required_outer)
+{
+	HbRelInfo  *ri = rel->fdw_private;
+	double		rows,
+				fetched,
+				rpcs;
+	bool		get;
+	QualCost	qc;
+	Cost		su,
+				tot;
+	List	   *pk = key_pathkeys(root, rel, relid, ri->katt);
+	ForeignPath *p;
+
+	rows = estimate(root, rel, ri, clauses, &fetched, &get);
+	rpcs = ceil(fetched / ri->o.batch) + (get ? 0 : 3);
+
+	/* all quals are rechecked locally, the pushed ones too */
+	cost_qual_eval(&qc, extract_actual_clauses(clauses, false), root);
+	su = (required_outer ? 0 : HB_CONNECT_COST) + HB_RPC_COST + qc.startup;
+	tot = su + (rpcs - 1) * HB_RPC_COST +
+		fetched * (cpu_tuple_cost + HB_ROW_COST + qc.per_tuple);
+
+#if PG_VERSION_NUM >= 180000
+	p = create_foreignscan_path(root, rel, NULL, rows, 0, su, tot, pk,
+								required_outer, NULL, NIL, NIL);
+#elif PG_VERSION_NUM >= 170000
+	p = create_foreignscan_path(root, rel, NULL, rows, su, tot, pk,
+								required_outer, NULL, NIL, NIL);
+#else
+	p = create_foreignscan_path(root, rel, NULL, rows, su, tot, pk,
+								required_outer, NULL, NIL);
+#endif
+	add_path(rel, (Path *) p);
+}
+
+/* generate_implied_equalities_for_column callback: our rowkey? */
+static bool
+ec_is_key(PlannerInfo *root, RelOptInfo *rel, EquivalenceClass *ec,
+		  EquivalenceMember *em, void *arg)
+{
+	return is_key_var((Node *) em->em_expr, rel->relid, *(AttrNumber *) arg);
+}
+
+/*
+ * The plain path, and, like an index on the row key, a parameterized path
+ * for every set of outer rels a join clause "rowkey op outer value" needs:
+ * as the inner side of a nested loop it looks up each outer row's key.
+ */
+static void
+hbGetForeignPaths(PlannerInfo *root, RelOptInfo *rel, Oid relid)
+{
+	HbRelInfo  *ri = rel->fdw_private;
+	List	   *cand = NIL,
+			   *ppis = NIL;
+	ListCell   *lc;
+
+	/* a LATERAL reference makes even the plain path parameterized */
+	add_hb_path(root, rel, relid, rel->baserestrictinfo, rel->lateral_relids);
+
+	if (ri->katt == InvalidAttrNumber)
+		return;
+
+	/* join clauses: in joininfo, or (k = l.x) only in an EquivalenceClass */
+	foreach(lc, rel->joininfo)
+		cand = lappend(cand, lfirst(lc));
+	if (rel->has_eclass_joins)
+		cand = list_concat(cand,
+						   generate_implied_equalities_for_column(root, rel,
+																  ec_is_key, &ri->katt,
+																  rel->lateral_referencers));
+	foreach(lc, cand)
+	{
+		RestrictInfo *r = lfirst(lc);
+		Relids		outer;
+		Node	   *val;
+		int			op;
+
+		if (!join_clause_is_movable_to(r, rel) ||
+			!key_cond(r, rel->relid, ri->katt, &val, &op))
+			continue;
+		outer = bms_del_member(bms_union(r->clause_relids, rel->lateral_relids),
+							   rel->relid);
+		if (bms_is_empty(outer))
+			continue;
+		/* get_baserel_parampathinfo makes no duplicates: pointers compare */
+		ppis = list_append_unique_ptr(ppis,
+									  get_baserel_parampathinfo(root, rel, outer));
+	}
+
+	/* the path's clauses: our own plus every join clause movable here */
+	foreach(lc, ppis)
+	{
+		ParamPathInfo *ppi = lfirst(lc);
+
+		add_hb_path(root, rel, relid,
+					list_concat_copy(rel->baserestrictinfo, ppi->ppi_clauses),
+					ppi->ppi_req_outer);
+	}
+}
+
+static ForeignScan *
+hbGetForeignPlan(PlannerInfo *root, RelOptInfo *rel, Oid relid,
+				 ForeignPath *best, List *tlist, List *clauses, Plan *outer)
+{
+	HbRelInfo  *ri = rel->fdw_private;
+	Bitmapset  *used = ri->used;
+	List	   *atts = NIL,
+			   *kexprs = NIL,
+			   *kops = NIL;
+	char	   *kname;
+	int			k = -1;
+
+	/* row-key conditions (with join clauses, if parameterized) go to HBase */
+	key_conds(rel, ri->katt, clauses, &kexprs, &kops, NULL);
+	kname = ri->katt == InvalidAttrNumber ? "" :
+		get_attname(relid, ri->katt, false);
+
+	/* every qual is still checked locally by the executor */
+	clauses = extract_actual_clauses(clauses, false);
+
+	/* attnos needed (0 = whole row, i.e. everything) */
+	while ((k = bms_next_member(used, k)) >= 0)
+	{
+		AttrNumber	a = k + FirstLowInvalidHeapAttributeNumber;
+
+		if (a >= 0)
+			atts = lappend_int(atts, a);
+	}
+
+	return make_foreignscan(tlist, clauses, rel->relid, kexprs,
+							list_make3(atts, kops, makeString(kname)), NIL, NIL, outer);
+}
+
+/* ---------- execution ---------- */
+
+static void
+add_h(HbState *st, char *s)
+{
+	int			j;
+
+	for (j = 0; j < st->nh; j++)
+		if (strcmp(st->hcols[j], s) == 0)
+			return;
+	st->hcols[st->nh++] = s;
+}
+
+/*
+ * Decide what to fetch. HBase silently drops rows that have no cell in the
+ * requested columns, so projecting to just the needed qualifiers would make
+ * "SELECT name" return fewer rows than "SELECT count(*)". A row belongs to
+ * the foreign table iff it has a cell in one of the mapped families, so by
+ * default we ask for those whole families and project here. If the user
+ * declared some column NOT NULL (i.e. promised every row has that cell), we
+ * can ask for the needed qualifiers plus that one and still see every row.
+ */
+static void
+setup_cols(HbState *st, Relation rel, List *atts)
+{
+	TupleDesc	td = RelationGetDescr(rel);
+	Oid			relid = RelationGetRelid(rel);
+	bool		all = list_member_int(atts, 0);
+	char	  **spec = palloc0(sizeof(char *) * td->natts);
+	char	   *nn = NULL;
+	List	   *fams = NIL;
+	ListCell   *lc;
+	int			i,
+				nkey = 0;
+
+	for (i = 0; i < td->natts; i++)
+	{
+		Form_pg_attribute a = TupleDescAttr(td, i);
+		char	   *f;
+
+		if (a->attisdropped)
+			continue;
+		spec[i] = att_spec(relid, i + 1, NameStr(a->attname), &st->o);
+		if (!spec[i])
+		{
+			nkey++;
+			continue;
+		}
+		if (a->attnotnull && !nn)
+			nn = spec[i];
+		f = pnstrdup(spec[i], strchr(spec[i], ':') - spec[i]);
+		if (!list_member(fams, makeString(f)))
+			fams = lappend(fams, makeString(f));
+	}
+	if (nkey > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				 errmsg("foreign table \"%s\" has more than one rowkey column",
+						RelationGetRelationName(rel))));
+
+	st->cols = palloc0(sizeof(Col) * td->natts);
+	st->hcols = palloc0(sizeof(char *) * (td->natts + 1));
+	for (i = 0; i < td->natts; i++)
+	{
+		Form_pg_attribute a = TupleDescAttr(td, i);
+		Col		   *c;
+		Oid			fn;
+
+		if (a->attisdropped || (!all && !list_member_int(atts, i + 1)))
+			continue;
+		c = &st->cols[st->ncols++];
+		c->att = i + 1;
+		c->spec = spec[i];
+		c->len = c->spec ? strlen(c->spec) : 0;
+		c->typ = a->atttypid;
+		c->typmod = a->atttypmod;
+		getTypeInputInfo(c->typ, &fn, &c->ioparam);
+		fmgr_info(fn, &c->in);
+		if (c->spec)
+			st->nq++;
+	}
+	/* nothing but (maybe) the row key needed, e.g. count(*) */
+	st->keyonly = (st->nq == 0);
+
+	if (nn)
+	{
+		for (i = 0; i < st->ncols; i++)
+			if (st->cols[i].spec)
+				add_h(st, st->cols[i].spec);
+		add_h(st, nn);
+		st->byqual = true;
+	}
+	else
+		foreach(lc, fams)
+			add_h(st, strVal(lfirst(lc)));
+}
+
+static void
+hbBeginForeignScan(ForeignScanState *node, int eflags)
+{
+	ForeignScan *fs = (ForeignScan *) node->ss.ps.plan;
+	Relation	rel = node->ss.ss_currentRelation;
+	HbState  *st = palloc0(sizeof(HbState));
+
+	List	   *kops = lsecond(fs->fdw_private);
+	ListCell   *lc;
+	int			i = 0;
+
+	node->fdw_state = st;
+	st->rel = rel;
+	get_opts(RelationGetRelid(rel), &st->o);
+	setup_cols(st, rel, (List *) linitial(fs->fdw_private));
+	st->kname = strVal(lthird(fs->fdw_private));
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	st->nk = list_length(fs->fdw_exprs);
+	st->kc = palloc0(sizeof(KeyCond) * Max(st->nk, 1));
+	foreach(lc, fs->fdw_exprs)
+	{
+		KeyCond    *k = &st->kc[i];
+		Oid			typ = exprType(lfirst(lc)),
+					fn;
+		bool		varlena;
+
+		k->x = ExecInitExpr(lfirst(lc), (PlanState *) node);
+		k->op = list_nth_int(kops, i++);
+		if (k->op == KC_IN)
+		{
+			typ = k->elem = get_element_type(typ);
+			get_typlenbyvalalign(typ, &k->elen, &k->ebyval, &k->ealign);
+		}
+		k->raw = (typ == TEXTOID || typ == VARCHAROID || typ == BYTEAOID);
+		k->text = (typ != BYTEAOID);
+		getTypeOutputInfo(typ, &fn, &varlena);
+		fmgr_info(fn, &k->out);
+	}
+	st->kcxt = AllocSetContextCreate(node->ss.ps.state->es_query_cxt,
+									 "hbase_fdw bounds", ALLOCSET_SMALL_SIZES);
+	st->bcxt = AllocSetContextCreate(node->ss.ps.state->es_query_cxt,
+									 "hbase_fdw batch", ALLOCSET_DEFAULT_SIZES);
+	/* socket is closed by a reset callback on this (query) context */
+	st->conn = hb_connect(st->o.host, st->o.port, st->o.tmo * 1000);
+}
+
+static void
+conv_ctx(void *arg)
+{
+	HbState  *st = arg;
+	TupleDesc	td = RelationGetDescr(st->rel);
+
+	if (st->cur && st->ccol)
+		errcontext("HBase table \"%s\", row key \"%.*s\", column \"%s\"",
+				   st->o.table, Min(st->cur->keylen, 64), st->cur->key,
+				   NameStr(TupleDescAttr(td, st->ccol->att - 1)->attname));
+}
+
+static Datum
+conv(Col *c, char *p, int len)
+{
+	if (c->typ == BYTEAOID)
+	{
+		bytea	   *b = palloc(VARHDRSZ + len);
+
+		SET_VARSIZE(b, VARHDRSZ + len);
+		memcpy(VARDATA(b), p, len);
+		return PointerGetDatum(b);
+	}
+	/* text input functions want a clean, NUL terminated string */
+	if (memchr(p, '\0', len))
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_STRING_FORMAT),
+				 errmsg("HBase value contains a zero byte"),
+				 errhint("Declare the column as bytea to read binary data.")));
+	pg_verify_mbstr(GetDatabaseEncoding(), p, len, false);
+	return InputFunctionCall(&c->in, p, c->ioparam, c->typmod);
+}
+
+static void
+fill(HbState *st, TupleTableSlot *slot, HbRow *r)
+{
+	Datum	   *v = slot->tts_values;
+	bool	   *nl = slot->tts_isnull;
+	ErrorContextCallback cb;
+	int			i,
+				j;
+
+	memset(nl, true, sizeof(bool) * slot->tts_tupleDescriptor->natts);
+
+	cb.callback = conv_ctx;
+	cb.arg = st;
+	cb.previous = error_context_stack;
+	error_context_stack = &cb;
+	st->cur = r;
+
+	for (i = 0; i < st->ncols; i++)
+	{
+		Col		   *c = &st->cols[i];
+		int			a = c->att - 1;
+
+		st->ccol = c;
+		if (!c->spec)
+		{
+			v[a] = conv(c, r->key, r->keylen);
+			nl[a] = false;
+			continue;
+		}
+		for (j = 0; j < r->ncells; j++)
+		{
+			HbCell	   *x = &r->cells[j];
+
+			if (x->collen == c->len && memcmp(x->col, c->spec, c->len) == 0)
+			{
+				v[a] = conv(c, x->val ? x->val : "", x->val ? x->vallen : 0);
+				nl[a] = false;
+				break;
+			}
+		}
+	}
+	error_context_stack = cb.previous;
+	st->cur = NULL;
+	st->ccol = NULL;
+}
+
+/* unsigned byte order, as HBase compares row keys */
+static int
+kcmp(const char *a, int alen, const char *b, int blen)
+{
+	int			c = Min(alen, blen) ? memcmp(a, b, Min(alen, blen)) : 0;
+
+	return c ? c : (alen > blen) - (alen < blen);
+}
+
+/* copy of k[0..len) in cxt, plus a \0 byte so k\0 is at hand too */
+static char *
+kcopy(MemoryContext cxt, const char *k, int len)
+{
+	char	   *r = MemoryContextAllocZero(cxt, len + 1);
+
+	memcpy(r, k, len);
+	return r;
+}
+
+/*
+ * Narrow the scan to keys >= k (> k if next: the smallest key after k is
+ * k\0). An empty k bounds nothing, as HBase has no empty keys.
+ */
+static void
+raise_start(HbState *st, const char *k, int len, bool next)
+{
+	int			n = len + (next ? 1 : 0);
+	char	   *c = kcopy(st->kcxt, k, len);
+
+	if (n > 0 && (!st->start || kcmp(c, n, st->start, st->startlen) > 0))
+	{
+		st->start = c;
+		st->startlen = n;
+	}
+}
+
+/* narrow the scan to keys < k (<= k if next); false if that leaves none */
+static bool
+lower_stop(HbState *st, const char *k, int len, bool next)
+{
+	int			n = len + (next ? 1 : 0);
+	char	   *c = kcopy(st->kcxt, k, len);
+
+	if (n == 0)
+		return false;			/* key < '': there is no such key */
+	if (!st->stop || kcmp(c, n, st->stop, st->stoplen) < 0)
+	{
+		st->stop = c;
+		st->stoplen = n;
+	}
+	return true;
+}
+
+/*
+ * Keys starting with p: [p, p+1) where p+1 is p with its last byte bumped,
+ * after dropping trailing 0xff bytes (they have no successor). All 0xff (or
+ * empty): no upper bound.
+ */
+static void
+prefix_range(HbState *st, const char *p, int len)
+{
+	char	   *q = kcopy(st->kcxt, p, len);
+	int			n = len;
+
+	raise_start(st, p, len, false);
+	while (n > 0 && (unsigned char) q[n - 1] == 0xff)
+		n--;
+	if (n == 0)
+		return;
+	q[n - 1]++;
+	lower_stop(st, q, n, false);
+}
+
+/* the row-key bytes for value d of condition k (in the current context) */
+static void
+key_bytes(KeyCond *k, Datum d, char **p, int *len)
+{
+	if (k->raw)
+	{
+		struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
+
+		*p = VARDATA_ANY(v);
+		*len = VARSIZE_ANY_EXHDR(v);
+	}
+	else
+	{
+		*p = OutputFunctionCall(&k->out, d);
+		*len = strlen(*p);
+	}
+}
+
+static int
+hbkey_cmp(const void *a, const void *b)
+{
+	const HbKey *x = a,
+			   *y = b;
+
+	return kcmp(x->p, x->len, y->p, y->len);
+}
+
+/* sort and dedupe keys[0..n) in place; returns the new count */
+static int
+sort_keys(HbKey *keys, int n)
+{
+	int			i,
+				m = 0;
+
+	if (n > 1)
+		qsort(keys, n, sizeof(HbKey), hbkey_cmp);
+	for (i = 0; i < n; i++)
+		if (m == 0 || hbkey_cmp(&keys[m - 1], &keys[i]) != 0)
+			keys[m++] = keys[i];
+	return m;
+}
+
+/* keep the keys of sorted a that are also in sorted b; returns the count */
+static int
+intersect_keys(HbKey *a, int na, const HbKey *b, int nb)
+{
+	int			i = 0,
+				j = 0,
+				m = 0;
+
+	while (i < na && j < nb)
+	{
+		int			c = hbkey_cmp(&a[i], &b[j]);
+
+		if (c == 0)
+			a[m++] = a[i];
+		i += (c <= 0);
+		j += (c >= 0);
+	}
+	return m;
+}
+
+/*
+ * Evaluate the key conditions. = and IN give a set of keys (intersected if
+ * there are several), everything else the scan range [start, stop) (the
+ * intersection of all of them). With a key set the scan fetches just those
+ * keys that fall inside the range. Returns false if no row can match: a
+ * NULL value (our operators are strict), no non-empty key left (HBase has
+ * no empty keys) or an empty range. Done at every scan open, so a rescan
+ * picks up new parameter values.
+ */
+static bool
+set_bounds(ForeignScanState *node, HbState *st)
+{
+	ExprContext *ec = node->ss.ps.ps_ExprContext;
+	HbKey	   *set = NULL;
+	int			nset = -1,		/* -1 = no key set */
+				i,
+				j;
+
+	MemoryContextReset(st->kcxt);
+	st->start = st->stop = NULL;
+	st->startlen = st->stoplen = 0;
+	st->get = false;
+	st->keys = NULL;
+	st->nkeys = st->kpos = 0;
+
+	for (i = 0; i < st->nk; i++)
+	{
+		KeyCond    *k = &st->kc[i];
+		MemoryContext old = MemoryContextSwitchTo(ec->ecxt_per_tuple_memory);
+		bool		isnull,
+					exact = false;
+		Datum		d = ExecEvalExpr(k->x, ec, &isnull);
+		char	   *p = NULL;
+		int			len = 0;
+		HbKey	   *ks = NULL;
+		int			nks = 0;
+
+		if (!isnull && k->op == KC_IN)
+		{
+			Datum	   *ev;
+			bool	   *en;
+			int			ne;
+
+			deconstruct_array(DatumGetArrayTypeP(d), k->elem, k->elen,
+							  k->ebyval, k->ealign, &ev, &en, &ne);
+			ks = MemoryContextAlloc(st->kcxt, sizeof(HbKey) * Max(ne, 1));
+			for (j = 0; j < ne; j++)
+			{
+				if (en[j])
+					continue;	/* k = NULL is never true */
+				key_bytes(k, ev[j], &p, &len);
+				if (len == 0)
+					continue;	/* no such key */
+				ks[nks].p = kcopy(st->kcxt, p, len);
+				ks[nks++].len = len;
+			}
+		}
+		else if (!isnull)
+			key_bytes(k, d, &p, &len);
+		if (!isnull && k->op == KC_LIKE)
+		{
+			char	   *pat = p;
+
+			p = palloc(len + 1);
+			len = like_prefix(pat, len, k->text, p, &exact);
+		}
+		MemoryContextSwitchTo(old);
+
+		if (isnull)
+			return false;
+		switch (k->op)
+		{
+			case KC_LIKE:
+				if (!exact)
+				{
+					prefix_range(st, p, len);
+					break;
+				}
+				/* no wildcard: LIKE 'abc' is = 'abc' */
+				/* FALLTHROUGH */
+			case BTEqualStrategyNumber:
+				if (len == 0)
+					return false;
+				ks = MemoryContextAlloc(st->kcxt, sizeof(HbKey));
+				ks->p = kcopy(st->kcxt, p, len);
+				ks->len = len;
+				nks = 1;
+				/* FALLTHROUGH */
+			case KC_IN:
+				nks = sort_keys(ks, nks);
+				if (nset < 0)
+				{
+					set = ks;
+					nset = nks;
+				}
+				else
+					nset = intersect_keys(set, nset, ks, nks);
+				if (nset == 0)
+					return false;
+				break;
+			case KC_PREFIX:
+				prefix_range(st, p, len);
+				break;
+			case BTGreaterEqualStrategyNumber:
+				raise_start(st, p, len, false);
+				break;
+			case BTGreaterStrategyNumber:
+				raise_start(st, p, len, true);
+				break;
+			case BTLessStrategyNumber:
+				if (!lower_stop(st, p, len, false))
+					return false;
+				break;
+			case BTLessEqualStrategyNumber:
+				lower_stop(st, p, len, true);
+				break;
+			default:
+				elog(ERROR, "hbase_fdw: unknown key condition %d", k->op);
+		}
+	}
+	if (st->start && st->stop &&
+		kcmp(st->start, st->startlen, st->stop, st->stoplen) >= 0)
+		return false;
+	if (nset < 0)
+		return true;
+
+	/* a key set: keep the keys inside the range */
+	for (i = j = 0; i < nset; i++)
+		if ((!st->start ||
+			 kcmp(set[i].p, set[i].len, st->start, st->startlen) >= 0) &&
+			(!st->stop ||
+			 kcmp(set[i].p, set[i].len, st->stop, st->stoplen) < 0))
+			set[j++] = set[i];
+	st->get = true;
+	st->keys = set;
+	st->nkeys = j;
+	return j > 0;
+}
+
+static TupleTableSlot *
+hbIterateForeignScan(ForeignScanState *node)
+{
+	HbState  *st = node->fdw_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	ExecClearTuple(slot);
+	if (!st->begun)
+	{
+		st->begun = true;
+		if (!set_bounds(node, st))
+		{
+			st->eof = true;		/* no row can match: skip HBase entirely */
+			return slot;
+		}
+	}
+	/* a key set is fetched with hb_get_rows below, a range needs a scanner */
+	if (!st->get && !st->open && !st->eof)
+	{
+		HbScanSpec s = {0};
+
+		s.start = st->start;
+		s.startlen = st->startlen;
+		s.stop = st->stop;
+		s.stoplen = st->stoplen;
+		s.ncols = st->nh;
+		s.cols = st->hcols;
+		s.caching = st->o.batch;
+		s.keyonly = st->keyonly;
+		st->sid = hb_scan_open(st->conn, st->o.table, &s);
+		st->open = true;
+	}
+
+	while (st->pos >= st->n)
+	{
+		MemoryContext old;
+
+		if (st->eof)
+			return slot;
+		MemoryContextReset(st->bcxt);
+		old = MemoryContextSwitchTo(st->bcxt);
+		if (st->get)
+		{
+			/* batch_size keys per round trip; missing keys return nothing */
+			int			m = Min(st->o.batch, st->nkeys - st->kpos);
+
+			st->n = hb_get_rows(st->conn, st->o.table, st->keys + st->kpos, m,
+								st->hcols, st->nh, &st->rows);
+			st->kpos += m;
+			st->eof = (st->kpos >= st->nkeys);
+		}
+		else
+			st->n = hb_scan_next(st->conn, st->sid, st->o.batch, &st->rows);
+		MemoryContextSwitchTo(old);
+		st->pos = 0;
+		st->nrpc++;
+		if (st->n == 0 && st->open)
+		{
+			st->eof = true;
+			hb_scan_close(st->conn, st->sid);
+			st->open = false;
+		}
+	}
+
+	fill(st, slot, &st->rows[st->pos++]);
+	return ExecStoreVirtualTuple(slot);
+}
+
+static void
+hbReScanForeignScan(ForeignScanState *node)
+{
+	HbState  *st = node->fdw_state;
+
+	if (st->open)
+		hb_scan_close(st->conn, st->sid);
+	st->begun = st->open = st->eof = false;
+	st->n = st->pos = 0;
+	MemoryContextReset(st->bcxt);
+}
+
+static void
+hbEndForeignScan(ForeignScanState *node)
+{
+	HbState  *st = node->fdw_state;
+
+	if (!st || !st->conn)
+		return;
+	if (st->open)
+		hb_scan_close(st->conn, st->sid);
+	st->open = false;
+	hb_disconnect(st->conn);
+}
+
+/* row key for EXPLAIN: printable ASCII as is, other bytes as \xNN */
+static char *
+show_key(const char *k, int len)
+{
+	StringInfoData b;
+	int			i;
+
+	initStringInfo(&b);
+	for (i = 0; i < len; i++)
+	{
+		unsigned char c = k[i];
+
+		if (c == '\\')
+			appendStringInfoString(&b, "\\\\");
+		else if (c >= 0x20 && c < 0x7f)
+			appendStringInfoChar(&b, c);
+		else
+			appendStringInfo(&b, "\\x%02x", c);
+	}
+	return b.data;
+}
+
+static void
+hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
+{
+	HbState  *st = node->fdw_state;
+	ForeignScan *fs = (ForeignScan *) node->ss.ps.plan;
+
+	ExplainPropertyText("HBase Table", st->o.table, es);
+
+	/*
+	 * Deparse the values here, not in the planner: a Param needs the plan's
+	 * namespaces to print (and to not crash). The pushed quals are always in
+	 * plan->qual too, so EXPLAIN has just set es->deparse_cxt to this node
+	 * while printing "Filter".
+	 */
+	if (fs->fdw_exprs)
+	{
+		static const char *const opname[] = {
+			NULL, "<", "<=", "=", ">=", ">", "^@", "~~", "= ANY"
+		};
+		List	   *kops = lsecond(fs->fdw_private);
+		StringInfoData b;
+		ListCell   *lc;
+		int			i = 0;
+
+		initStringInfo(&b);
+		foreach(lc, fs->fdw_exprs)
+		{
+			int			op = list_nth_int(kops, i);
+
+			Assert(op >= BTLessStrategyNumber && op <= KC_IN);
+			appendStringInfo(&b, op == KC_IN ? "%s(%s %s (%s))" : "%s(%s %s %s)",
+							 i++ ? " AND " : "",
+							 quote_identifier(st->kname), opname[op],
+							 deparse_expression(lfirst(lc), es->deparse_cxt,
+												false, false));
+		}
+		ExplainPropertyText("HBase Key Cond", b.data, es);
+	}
+	/* what the last scan read, known once it has run */
+	if (es->analyze && st->get)
+		ExplainPropertyInteger("HBase Get Keys", NULL, st->nkeys, es);
+	if (es->analyze && !st->get && st->start)
+		ExplainPropertyText("HBase Start Row", show_key(st->start, st->startlen), es);
+	if (es->analyze && !st->get && st->stop)
+		ExplainPropertyText("HBase Stop Row", show_key(st->stop, st->stoplen), es);
+	if (es->verbose)
+	{
+		List	   *l = NIL;
+		int			i;
+
+		for (i = 0; i < st->nh; i++)
+			l = lappend(l, st->hcols[i]);
+		ExplainPropertyList(st->byqual ? "HBase Columns" : "HBase Families", l, es);
+		if (st->keyonly)
+			ExplainPropertyText("HBase Filter", "FirstKeyOnlyFilter() AND KeyOnlyFilter()", es);
+		ExplainPropertyInteger("Batch Size", NULL, st->o.batch, es);
+	}
+	if (es->analyze)
+		ExplainPropertyInteger("HBase RPCs", NULL, st->nrpc, es);
+}
+
+Datum
+hbase_fdw_handler(PG_FUNCTION_ARGS)
+{
+	FdwRoutine *r = makeNode(FdwRoutine);
+
+	r->GetForeignRelSize = hbGetForeignRelSize;
+	r->GetForeignPaths = hbGetForeignPaths;
+	r->GetForeignPlan = hbGetForeignPlan;
+	r->BeginForeignScan = hbBeginForeignScan;
+	r->IterateForeignScan = hbIterateForeignScan;
+	r->ReScanForeignScan = hbReScanForeignScan;
+	r->EndForeignScan = hbEndForeignScan;
+	r->ExplainForeignScan = hbExplainForeignScan;
+
+	PG_RETURN_POINTER(r);
+}

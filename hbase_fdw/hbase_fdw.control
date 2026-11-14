@@ -1,0 +1,4 @@
+comment = 'foreign data wrapper for HBase (via the Thrift gateway)'
+default_version = '1.0'
+module_pathname = '$libdir/hbase_fdw'
+relocatable = true
