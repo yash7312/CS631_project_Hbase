@@ -6,6 +6,9 @@
 #   ./setup.sh start    start PostgreSQL, HBase and the Thrift gateway
 #   ./setup.sh stop     stop them
 #   ./setup.sh test     rebuild hbase_fdw and run the regression test
+#   ./setup.sh proxy start [rtt_ms] [bw_mbit]   delay proxy on port 9190
+#   ./setup.sh proxy stop
+#   ./setup.sh proxy on|off   point server hb (database test) at the proxy / back
 #
 #   MOCK=1 ./setup.sh   same, with the in-memory mock HBase (no Java needed)
 #
@@ -25,6 +28,7 @@ HBASE_VER=${HBASE_VER:-3.0.0}
 HBASE_URL=${HBASE_URL:-https://archive.apache.org/dist/hbase/$HBASE_VER/hbase-$HBASE_VER-bin.tar.gz}
 PGPORT=${PGPORT:-9432}
 TPORT=${TPORT:-9090}
+PPORT=9190      # netem_proxy.py listens here and forwards to 9090
 MOCK=${MOCK:-$(cat "$W/mode" 2>/dev/null || echo 0)}
 JOBS=$(nproc 2>/dev/null || echo 2)
 APT="sudo apt install -y build-essential bison flex libreadline-dev zlib1g-dev pkg-config curl python3-pip openjdk-17-jdk-headless"
@@ -157,7 +161,32 @@ run_tests() {
 		die "tests failed, see hbase_fdw/regression.diffs"
 }
 
+proxy() {
+	case "${1:-}" in
+	start)
+		wait_port "$PPORT" 1 && die "port $PPORT is busy (is the proxy already running?)"
+		nohup python3 "$R/hbase_fdw/test/netem_proxy.py" "${2:-0}" "${3:-0}" >"$W/proxy.log" 2>&1 &
+		echo $! >"$W/proxy.pid"
+		wait_port "$PPORT" 10 || die "the proxy did not start, see $W/proxy.log"
+		say "proxy on port $PPORT: rtt ${2:-0} ms, bw ${3:-0} Mbit/s (change with hbase_fdw/test/ctl.py)"
+		;;
+	stop)
+		if [ -f "$W/proxy.pid" ]; then
+			kill "$(cat "$W/proxy.pid")" 2>/dev/null || true
+			rm -f "$W/proxy.pid"
+		fi
+		;;
+	on | off)
+		local p=$TPORT
+		[ "$1" = on ] && p=$PPORT
+		"$(pgbin psql)" -p "$PGPORT" -d test -c "ALTER SERVER hb OPTIONS (SET port '$p')"
+		;;
+	*) die "usage: ./setup.sh proxy start [rtt_ms] [bw_mbit] | stop | on | off" ;;
+	esac
+}
+
 stop_all() {
+	proxy stop
 	[ -x "$(pgbin pg_ctl)" ] && "$(pgbin pg_ctl)" -D "$W/pgdata" -m fast stop 2>/dev/null || true
 	if [ -f "$W/mock.pid" ]; then
 		kill "$(cat "$W/mock.pid")" 2>/dev/null || true
@@ -183,5 +212,6 @@ start)
 	;;
 stop) stop_all ;;
 test) build_fdw; run_tests ;;
-*) die "usage: ./setup.sh [all|start|stop|test]" ;;
+proxy) shift; proxy "$@" ;;
+*) die "usage: ./setup.sh [all|start|stop|test|proxy]" ;;
 esac

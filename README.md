@@ -36,6 +36,24 @@ in-memory mock HBase instead.
 | `./setup.sh start` | start PostgreSQL (port 9432), HBase and the Thrift gateway (port 9090) |
 | `./setup.sh stop` | stop them |
 | `./setup.sh test` | rebuild `hbase_fdw` and run the regression test |
+| `./setup.sh proxy start 5` | start the delay proxy on port 9190 with a 5 ms RTT (optional 2nd number: Mbit/s cap) |
+| `./setup.sh proxy on` / `off` | point server `hb` in database `test` at the proxy, or back at 9090 |
+| `./setup.sh proxy stop` | stop the proxy |
+
+### Testing over a slow network on one machine
+
+`hbase_fdw/test/netem_proxy.py` sits between PostgreSQL and the Thrift gateway
+and holds every chunk for RTT/2 in each direction, so each Thrift call pays one
+RTT, as it would across machines. No root needed.
+
+```bash
+./setup.sh proxy start 5 && ./setup.sh proxy on
+python3 hbase_fdw/test/rtt_probe.py     # should print a median close to 5 ms
+python3 hbase_fdw/test/ctl.py rtt 20    # change the RTT live; also: bw 100, stats, reset
+```
+
+The regression test makes its own server on port 9090, so it never goes
+through the proxy; the proxy is for `test/bench.sql` and the experiments.
 
 Already have your own PostgreSQL build? Build the extension against it with
 `make -C hbase_fdw USE_PGXS=1 PG_CONFIG=/path/to/pg_config install`.
