@@ -6,6 +6,7 @@ CREATE EXTENSION hbase_fdw;
 RESET client_min_messages;
 -- fixed costs: measured ones vary between runs and would change plans
 SET hbase_fdw.adaptive_costs = off;
+SET hbase_fdw.batch_join = off;  -- tested in hbase_batch.sql
 
 CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
   OPTIONS (host 'localhost', port '9090');

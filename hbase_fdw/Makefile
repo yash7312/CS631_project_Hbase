@@ -7,7 +7,7 @@ PGFILEDESC = "hbase_fdw - foreign data wrapper for HBase"
 
 # regression test needs a running HBase thrift server with test data,
 # see README (make installcheck)
-REGRESS = hbase_fdw
+REGRESS = hbase_fdw hbase_batch
 
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config

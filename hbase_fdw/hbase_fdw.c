@@ -41,6 +41,8 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "executor/executor.h"
+#include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
@@ -49,6 +51,8 @@
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
+#include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -98,6 +102,10 @@ static double force_rtt = -1;	/* ms, -1 = measure */
 static double force_bw = -1;	/* Mbit/s, -1 = measure */
 static double cpm = 20.0;		/* cost units per ms */
 static double row_us = 1.0;		/* client time per row, microseconds */
+
+/* batched join (Part C) */
+static bool batch_join = true;
+static int	join_batch = 500;	/* outer rows per batch, K */
 
 typedef struct Opt
 {
@@ -1816,6 +1824,505 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	}
 }
 
+/* ---------- batched index join (Part C) ---------- */
+
+/*
+ * For  ... JOIN hbase_table h ON h.rowkey = outer.col  (inner join, plain
+ * column), a join node that pulls K outer rows, fetches all their keys from
+ * HBase in one getRowsWithColumns call, then emits the outer rows in their
+ * own order joined with their HBase row. Round trips: outer rows / K
+ * instead of one per outer row.
+ *
+ * Plan shape: CustomScan with scanrelid 0 (a join), the outer plan as its
+ * only child, custom_scan_tlist = every Var the output and quals use. Its
+ * scan slot is built in that order: inner Vars from HBase, outer Vars from
+ * the outer tuple (opos = their position in the outer plan's output).
+ */
+static set_join_pathlist_hook_type prev_join_hook = NULL;
+static CustomPathMethods bj_path_methods;
+static CustomScanMethods bj_scan_methods;
+static CustomExecMethods bj_exec_methods;
+
+typedef struct BjState
+{
+	CustomScanState css;
+	HbState		hb;				/* the HBase side, set up like a foreign scan */
+	Relation	rel;			/* the HBase table */
+	TupleTableSlot *inslot;		/* one HBase row, in the table's columns */
+	int			nflat;
+	int		   *opos;			/* per scan-slot column: outer position, 0 = HBase */
+	int		   *iatt;			/* ... and its HBase table attno */
+	int			kpos;			/* outer position of the key column */
+	int			K;
+	KeyCond		kk;				/* how to turn an outer key into bytes */
+
+	TupleTableSlot **outs;		/* buffered outer rows */
+	HbKey	   *okeys;			/* their keys, p = NULL for NULL / empty */
+	int			nout,
+				k;				/* next buffered row to emit */
+	HbRow	   *rows;			/* HBase rows for this batch */
+	int			nrows;
+	bool		done;			/* outer side finished */
+	MemoryContext bcxt;			/* keys and rows of one batch */
+	long		nbatch,
+				nrpc;
+} BjState;
+
+/* cost of the HBase side of a batched join with n outer rows */
+static void
+bj_cost(RelOptInfo *inner, Oid relid, double n, double out, Cost *su, Cost *tot)
+{
+	HbRelInfo  *ri = inner->fdw_private;
+	double		b = ceil(n / join_batch);	/* batches */
+	double		rpcs = b * ceil((double) join_batch / ri->o.batch);
+
+	rpcs = Max(1, Min(rpcs, b * ceil(n / b / ri->o.batch)));
+	if (adaptive)
+	{
+		int			i = find_srv(GetForeignTable(relid)->serverid, &ri->o, relid);
+		double		bpr = Max(1, bms_num_members(ri->used)) * rel_bpc(relid);
+
+		*su = (w_conn[i] + srv_call(i)) * cpm;
+		*tot = (w_conn[i] + rpcs * srv_call(i) + out * bpr / srv_bw(i) +
+				out * row_us / 1000.0) * cpm;
+	}
+	else
+	{
+		*su = HB_CONNECT_COST + HB_RPC_COST;
+		*tot = HB_CONNECT_COST + rpcs * HB_RPC_COST + out * HB_ROW_COST;
+	}
+}
+
+static void
+bj_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
+		RelOptInfo *innerrel, JoinType jt, JoinPathExtraData *extra)
+{
+	HbRelInfo  *ri;
+	Path	   *op = outerrel->cheapest_total_path;
+	CustomPath *cp;
+	Var		   *ov = NULL;
+	ListCell   *lc;
+	Oid			relid;
+	Cost		su,
+				tot;
+
+	if (prev_join_hook)
+		prev_join_hook(root, joinrel, outerrel, innerrel, jt, extra);
+	if (!batch_join || jt != JOIN_INNER)
+		return;
+	if (innerrel->reloptkind != RELOPT_BASEREL || innerrel->fdwroutine == NULL ||
+		innerrel->fdwroutine->GetForeignPaths != hbGetForeignPaths)
+		return;					/* inner side is not one of our tables */
+	ri = innerrel->fdw_private;
+	if (ri == NULL || ri->katt == InvalidAttrNumber ||
+		!bms_is_empty(innerrel->lateral_relids))
+		return;
+	if (op == NULL || op->param_info != NULL)
+		return;
+
+	/* v1 limits: the join outputs plain columns only */
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		Var		   *v = lfirst(lc);
+
+		if (!IsA(v, Var) || v->varattno <= 0)
+			return;
+	}
+
+	/* find  inner.rowkey = outer.column  among the join clauses */
+	foreach(lc, extra->restrictlist)
+	{
+		Node	   *val;
+		int			kop;
+
+		if (key_cond(lfirst(lc), innerrel->relid, ri->katt, &val, &kop) &&
+			kop == BTEqualStrategyNumber)
+		{
+			while (IsA(val, RelabelType))
+				val = (Node *) ((RelabelType *) val)->arg;
+			if (IsA(val, Var) && ((Var *) val)->varattno > 0 &&
+				bms_is_member(((Var *) val)->varno, outerrel->relids))
+			{
+				ov = (Var *) val;
+				break;
+			}
+		}
+	}
+	if (ov == NULL)
+		return;
+
+	relid = planner_rt_fetch(innerrel->relid, root)->relid;
+	bj_cost(innerrel, relid, op->rows, joinrel->rows, &su, &tot);
+
+	cp = makeNode(CustomPath);
+	cp->path.pathtype = T_CustomScan;
+	cp->path.parent = joinrel;
+	cp->path.pathtarget = joinrel->reltarget;
+	cp->path.rows = joinrel->rows;
+	cp->path.startup_cost = op->startup_cost + su;
+	cp->path.total_cost = op->total_cost + tot +
+		op->rows * cpu_operator_cost + joinrel->rows * cpu_tuple_cost;
+	cp->path.pathkeys = op->pathkeys;	/* outer order survives */
+	cp->custom_paths = list_make1(op);
+	cp->custom_private = list_make4(ov, extra->restrictlist,
+									innerrel->baserestrictinfo,
+									makeInteger(innerrel->relid));
+	cp->methods = &bj_path_methods;
+	add_path(joinrel, (Path *) cp);
+}
+
+static Plan *
+bj_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *cp, List *tlist,
+		List *clauses, List *plans)
+{
+	CustomScan *cs = makeNode(CustomScan);
+	Var		   *ov = linitial(cp->custom_private);
+	int			inner = intVal(lfourth(cp->custom_private));
+	List	   *quals,
+			   *flat,
+			   *opos = NIL,
+			   *iatt = NIL;
+	Plan	   *outer = linitial(plans);
+	int			kpos = 0;
+	ListCell   *lc,
+			   *lc2;
+
+	/* join clauses are not in 'clauses' for a join: they came with the path */
+	quals = list_concat(extract_actual_clauses(lsecond(cp->custom_private), false),
+						extract_actual_clauses(lthird(cp->custom_private), false));
+
+	/* every Var the output and the quals use, in one flat list */
+	flat = add_to_flat_tlist(NIL, pull_var_clause((Node *) tlist, 0));
+	flat = add_to_flat_tlist(flat, pull_var_clause((Node *) quals, 0));
+
+	foreach(lc, flat)
+	{
+		Var		   *v = (Var *) ((TargetEntry *) lfirst(lc))->expr;
+		int			pos = 0,
+					i = 1;
+
+		if (v->varno == inner)
+		{
+			opos = lappend_int(opos, 0);
+			iatt = lappend_int(iatt, v->varattno);
+			continue;
+		}
+		foreach(lc2, outer->targetlist)
+		{
+			Var		   *o = (Var *) ((TargetEntry *) lfirst(lc2))->expr;
+
+			if (IsA(o, Var) && o->varno == v->varno && o->varattno == v->varattno)
+				pos = i;
+			i++;
+		}
+		if (pos == 0)
+			elog(ERROR, "hbase_fdw: outer column not found in the outer plan");
+		opos = lappend_int(opos, pos);
+		iatt = lappend_int(iatt, 0);
+	}
+	/* where the outer key column sits in the outer plan's output */
+	foreach(lc, outer->targetlist)
+	{
+		Var		   *o = (Var *) ((TargetEntry *) lfirst(lc))->expr;
+
+		kpos++;
+		if (IsA(o, Var) && o->varno == ov->varno && o->varattno == ov->varattno)
+			break;
+	}
+	if (kpos > list_length(outer->targetlist))
+		elog(ERROR, "hbase_fdw: join key not found in the outer plan");
+
+	cs->scan.plan.targetlist = tlist;
+	cs->scan.plan.qual = quals;	/* ExecScan checks these on each joined row */
+	cs->scan.scanrelid = 0;		/* a join: no single relation */
+	cs->custom_scan_tlist = flat;
+	cs->custom_plans = plans;
+	/* the table's OID, not its range table index: setrefs renumbers those */
+	cs->custom_private = list_make3(opos, iatt,
+									list_make3_oid(planner_rt_fetch(inner, root)->relid,
+												   join_batch, kpos));
+	cs->methods = &bj_scan_methods;
+	return (Plan *) cs;
+}
+
+static Node *
+bj_create(CustomScan *cs)
+{
+	BjState    *s = palloc0(sizeof(BjState));
+
+	NodeSetTag(s, T_CustomScanState);
+	s->css.methods = &bj_exec_methods;
+	return (Node *) s;
+}
+
+static void
+bj_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	BjState    *s = (BjState *) node;
+	CustomScan *cs = (CustomScan *) node->ss.ps.plan;
+	List	   *opos = linitial(cs->custom_private),
+			   *iatt = lsecond(cs->custom_private),
+			   *ints = lthird(cs->custom_private),
+			   *atts = NIL;
+	Oid			relid = linitial_oid(ints);
+	TupleDesc	otd;
+	Form_pg_attribute ka;
+	Oid			fn;
+	bool		varlena;
+	int			i;
+
+	node->custom_ps = list_make1(ExecInitNode(linitial(cs->custom_plans), estate, eflags));
+	s->K = lsecond_oid(ints);
+	s->kpos = lthird_oid(ints);
+	s->nflat = list_length(opos);
+	s->opos = palloc(sizeof(int) * Max(s->nflat, 1));
+	s->iatt = palloc(sizeof(int) * Max(s->nflat, 1));
+	for (i = 0; i < s->nflat; i++)
+	{
+		s->opos[i] = list_nth_int(opos, i);
+		s->iatt[i] = list_nth_int(iatt, i);
+		if (s->opos[i] == 0)
+			atts = list_append_unique_int(atts, s->iatt[i]);
+	}
+
+	/* the HBase side: the same setup a foreign scan does */
+	s->rel = table_open(relid, AccessShareLock);
+	s->hb.rel = s->rel;
+	get_opts(relid, &s->hb.o);
+	setup_cols(&s->hb, s->rel, atts);
+	s->inslot = MakeSingleTupleTableSlot(RelationGetDescr(s->rel), &TTSOpsVirtual);
+
+	/* outer key -> bytes, as key_bytes() does for a key condition */
+	otd = ExecGetResultType(linitial(node->custom_ps));
+	ka = TupleDescAttr(otd, s->kpos - 1);
+	s->kk.raw = (ka->atttypid == TEXTOID || ka->atttypid == VARCHAROID ||
+				 ka->atttypid == BYTEAOID);
+	getTypeOutputInfo(ka->atttypid, &fn, &varlena);
+	fmgr_info(fn, &s->kk.out);
+
+	s->outs = palloc(sizeof(TupleTableSlot *) * s->K);
+	for (i = 0; i < s->K; i++)
+		s->outs[i] = MakeSingleTupleTableSlot(otd, &TTSOpsMinimalTuple);
+	s->okeys = palloc(sizeof(HbKey) * s->K);
+	s->bcxt = AllocSetContextCreate(estate->es_query_cxt, "hbase_fdw batch join",
+									ALLOCSET_DEFAULT_SIZES);
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+	s->hb.conn = hb_connect(s->hb.o.host, s->hb.o.port, s->hb.o.tmo * 1000);
+	s->hb.wi = srv_slot(GetForeignTable(relid)->serverid);
+}
+
+/* pull up to K outer rows and fetch all their keys from HBase */
+static void
+bj_load(BjState *s)
+{
+	PlanState  *child = linitial(s->css.custom_ps);
+	HbKey	   *keys;
+	MemoryContext old;
+	int			n = 0,
+				i,
+				nk = 0;
+
+	MemoryContextReset(s->bcxt);
+	s->nout = s->k = s->nrows = 0;
+	while (s->nout < s->K)
+	{
+		TupleTableSlot *o = ExecProcNode(child);
+
+		if (TupIsNull(o))
+		{
+			s->done = true;
+			break;
+		}
+		ExecCopySlot(s->outs[s->nout++], o);
+	}
+	if (s->nout == 0)
+		return;
+
+	old = MemoryContextSwitchTo(s->bcxt);
+	keys = palloc(sizeof(HbKey) * s->nout);
+	for (i = 0; i < s->nout; i++)
+	{
+		bool		isnull;
+		Datum		d = slot_getattr(s->outs[i], s->kpos, &isnull);
+		HbKey	   *k = &s->okeys[i];
+
+		k->p = NULL;
+		k->len = 0;
+		if (isnull)
+			continue;			/* NULL never matches */
+		key_bytes(&s->kk, d, &k->p, &k->len);
+		if (k->len == 0)
+		{
+			k->p = NULL;		/* HBase has no empty row key */
+			continue;
+		}
+		keys[nk++] = *k;
+	}
+	nk = sort_keys(keys, nk);
+
+	s->rows = palloc(sizeof(HbRow) * Max(nk, 1));
+	for (i = 0; i < nk; i += s->hb.o.batch)
+	{
+		HbRow	   *r;
+		int			m = hb_get_rows(s->hb.conn, s->hb.o.table, keys + i,
+									Min(s->hb.o.batch, nk - i),
+									s->hb.hcols, s->hb.nh, &r);
+
+		memcpy(s->rows + n, r, sizeof(HbRow) * m);
+		n += m;
+		s->nrpc++;
+	}
+	s->nrows = n;
+	s->nbatch++;
+	MemoryContextSwitchTo(old);
+}
+
+/* the HBase row with this key, or NULL: a plain loop, rows <= K */
+static HbRow *
+bj_find(BjState *s, HbKey *k)
+{
+	int			i;
+
+	if (k->p == NULL)
+		return NULL;
+	for (i = 0; i < s->nrows; i++)
+		if (kcmp(s->rows[i].key, s->rows[i].keylen, k->p, k->len) == 0)
+			return &s->rows[i];
+	return NULL;
+}
+
+/* fill the scan slot from outer row o and HBase row r */
+static void
+bj_row(BjState *s, TupleTableSlot *o, HbRow *r)
+{
+	TupleTableSlot *out = s->css.ss.ss_ScanTupleSlot;
+	TupleTableSlot *in = s->inslot;
+	int			i;
+
+	ExecClearTuple(out);
+	ExecClearTuple(in);
+	fill(&s->hb, in, r);		/* fill() only writes the value arrays */
+	ExecStoreVirtualTuple(in);
+	slot_getallattrs(o);
+	for (i = 0; i < s->nflat; i++)
+	{
+		if (s->opos[i] == 0)
+		{
+			out->tts_values[i] = in->tts_values[s->iatt[i] - 1];
+			out->tts_isnull[i] = in->tts_isnull[s->iatt[i] - 1];
+		}
+		else
+		{
+			out->tts_values[i] = o->tts_values[s->opos[i] - 1];
+			out->tts_isnull[i] = o->tts_isnull[s->opos[i] - 1];
+		}
+	}
+	ExecStoreVirtualTuple(out);
+}
+
+static TupleTableSlot *
+bj_next(ScanState *ss)
+{
+	BjState    *s = (BjState *) ss;
+
+	for (;;)
+	{
+		while (s->k < s->nout)	/* the buffered outer rows, in order */
+		{
+			TupleTableSlot *o = s->outs[s->k];
+			HbRow	   *r = bj_find(s, &s->okeys[s->k]);
+
+			s->k++;
+			if (r == NULL)
+				continue;		/* inner join: no match, no row */
+			/* converted values live until ExecScan's next per-tuple reset */
+			{
+				MemoryContext old =
+					MemoryContextSwitchTo(ss->ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+				bj_row(s, o, r);
+				MemoryContextSwitchTo(old);
+			}
+			return ss->ss_ScanTupleSlot;
+		}
+		if (s->done)
+			return ExecClearTuple(ss->ss_ScanTupleSlot);
+		bj_load(s);
+	}
+}
+
+static bool
+bj_recheck(ScanState *ss, TupleTableSlot *slot)
+{
+	return true;
+}
+
+static TupleTableSlot *
+bj_exec(CustomScanState *node)
+{
+	return ExecScan(&node->ss, bj_next, bj_recheck);
+}
+
+static void
+bj_rescan(CustomScanState *node)
+{
+	BjState    *s = (BjState *) node;
+
+	ExecReScan(linitial(node->custom_ps));
+	s->nout = s->k = s->nrows = 0;
+	s->done = false;
+}
+
+static void
+bj_end(CustomScanState *node)
+{
+	BjState    *s = (BjState *) node;
+
+	ExecEndNode(linitial(node->custom_ps));
+	if (s->hb.conn)
+		hb_disconnect(s->hb.conn);
+	ExecDropSingleTupleTableSlot(s->inslot);
+	for (int i = 0; i < s->K; i++)
+		ExecDropSingleTupleTableSlot(s->outs[i]);
+	table_close(s->rel, AccessShareLock);
+}
+
+static void
+bj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	BjState    *s = (BjState *) node;
+
+	ExplainPropertyText("HBase Table", s->hb.o.table, es);
+	ExplainPropertyInteger("Batch Size", NULL, s->K, es);
+	if (es->analyze)
+	{
+		ExplainPropertyInteger("Batches", NULL, s->nbatch, es);
+		ExplainPropertyInteger("HBase RPCs", NULL, s->nrpc, es);
+	}
+}
+
+static void
+bj_init(void)
+{
+	bj_path_methods.CustomName = "HBase Batched Join";
+	bj_path_methods.PlanCustomPath = bj_plan;
+
+	bj_scan_methods.CustomName = "HBase Batched Join";
+	bj_scan_methods.CreateCustomScanState = bj_create;
+	RegisterCustomScanMethods(&bj_scan_methods);
+
+	bj_exec_methods.CustomName = "HBase Batched Join";
+	bj_exec_methods.BeginCustomScan = bj_begin;
+	bj_exec_methods.ExecCustomScan = bj_exec;
+	bj_exec_methods.EndCustomScan = bj_end;
+	bj_exec_methods.ReScanCustomScan = bj_rescan;
+	bj_exec_methods.ExplainCustomScan = bj_explain;
+
+	prev_join_hook = set_join_pathlist_hook;
+	set_join_pathlist_hook = bj_hook;
+}
+
 void
 _PG_init(void)
 {
@@ -1839,7 +2346,15 @@ _PG_init(void)
 							 "Client time per fetched row, in microseconds.",
 							 NULL, &row_us, 1.0, 0, 1e6, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("hbase_fdw.batch_join",
+							 "Offer a batched join that fetches K outer keys per HBase call.",
+							 NULL, &batch_join, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("hbase_fdw.join_batch",
+							"Outer rows per batched join call (K).",
+							NULL, &join_batch, 500, 1, 100000, PGC_USERSET, 0,
+							NULL, NULL, NULL);
 	MarkGUCPrefixReserved("hbase_fdw");
+	bj_init();
 }
 
 Datum
