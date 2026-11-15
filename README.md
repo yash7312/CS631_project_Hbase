@@ -64,6 +64,8 @@ Already have your own PostgreSQL build? Build the extension against it with
 | --- | --- |
 | `hbase_fdw/` | the extension: FDW callbacks (`hbase_fdw.c`), Thrift client (`hbase_thrift.c`), SQL, tests |
 | `hbase_fdw/README.md` | options, what is pushed down and when, EXPLAIN fields, design notes |
-| `hbase_fdw/test/` | data loader, mock HBase, benchmark scripts, Thrift IDL |
+| `hbase_fdw/test/` | data loader, mock HBase, delay proxy, sweep and benchmark scripts, Thrift IDL |
+| `results/` | real-HBase measurements (CSV) behind the graphs |
+| `graphs/` | one short script per report figure and the PNGs; `bash graphs/make_all.sh` redraws them |
 | `docs/` | report (PDF and LaTeX), handoff notes and the work log |
 | `setup.sh` | one-command build, start, stop and test |
