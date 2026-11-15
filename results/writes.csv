@@ -1,0 +1,9 @@
+op,rtt,mode,ms
+insert,0,one call per row,316.4
+insert,5,one call per row,7037.3
+insert,0,batched (100 rows/call),49.9
+insert,5,batched (100 rows/call),118.4
+update,0,one call per row,252.9
+update,5,one call per row,6389.9
+delete,0,one call per row,188.4
+delete,5,one call per row,6313.2
