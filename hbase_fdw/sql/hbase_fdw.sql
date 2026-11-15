@@ -4,6 +4,8 @@ SET client_min_messages = warning;
 DROP EXTENSION IF EXISTS hbase_fdw CASCADE;
 CREATE EXTENSION hbase_fdw;
 RESET client_min_messages;
+-- fixed costs: measured ones vary between runs and would change plans
+SET hbase_fdw.adaptive_costs = off;
 
 CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
   OPTIONS (host 'localhost', port '9090');

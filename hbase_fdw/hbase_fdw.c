@@ -52,6 +52,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
@@ -84,6 +85,19 @@ PG_FUNCTION_INFO_V1(hbase_fdw_validator);
 #define HB_CONNECT_COST	10.0
 #define HB_RPC_COST		15.0
 #define HB_ROW_COST		0.005
+
+/*
+ * Measured costs (hbase_fdw.adaptive_costs = on): a path is costed as the
+ * time it should take on this connection, in ms, times cost_per_ms:
+ *   connect + rpcs * rtt + bytes / bandwidth + rows * row_us
+ * rtt and connect are timed once per session per server (best of 3 pings);
+ * bandwidth and bytes per row are running totals from real scans.
+ */
+static bool adaptive = true;
+static double force_rtt = -1;	/* ms, -1 = measure */
+static double force_bw = -1;	/* Mbit/s, -1 = measure */
+static double cpm = 20.0;		/* cost units per ms */
+static double row_us = 1.0;		/* client time per row, microseconds */
 
 typedef struct Opt
 {
@@ -190,12 +204,157 @@ typedef struct HbState
 	int			n,
 				pos;
 	long		nrpc;			/* scannerGetList + getRowsWithColumns calls */
+	long		nrows;			/* rows fetched from HBase */
+	int			wi;				/* slot in the weight arrays, -1 = none yet */
 
 	/* for error context */
 	HbRow	   *cur;
 	Col		   *ccol;
 	Relation	rel;
 } HbState;
+
+/* ---------- measured weights (Part B) ---------- */
+
+/* per server: fixed arrays, searched in order; there are only a few */
+#define MAXSRV 16
+static int	nsrv = 0;
+static Oid	w_srv[MAXSRV];
+static double w_rtt[MAXSRV];	/* ms */
+static double w_conn[MAXSRV];	/* ms */
+static double w_bytes[MAXSRV];	/* bytes in big replies ... */
+static double w_ms[MAXSRV];		/* ... and their time beyond one rtt */
+
+/* per foreign table: bytes per row seen in real scans */
+#define MAXREL 64
+static int	nrel = 0;
+static Oid	r_rel[MAXREL];
+static double r_bytes[MAXREL];
+static double r_rows[MAXREL];
+
+/* slot of a server already measured, or -1 */
+static int
+srv_slot(Oid srv)
+{
+	int			i;
+
+	for (i = 0; i < nsrv; i++)
+		if (w_srv[i] == srv)
+			return i;
+	return -1;
+}
+
+static void rel_seen(Oid relid, double bytes, double rows);
+
+/*
+ * Slot of a server, measuring it the first time in this session:
+ * connect, best of 3 pings = rtt, then one batch of up to 1000 whole rows
+ * of this table for bandwidth and bytes per row. About 5 round trips, once.
+ */
+static int
+find_srv(Oid srv, HbOpts *o, Oid relid)
+{
+	int			i = srv_slot(srv),
+				k,
+				n;
+	HbConn	   *c;
+	HbScanSpec	sp = {0};
+	HbRow	   *rows;
+	int32		id;
+	double		best = 1e9;
+	MemoryContext cx,
+				old;
+
+	if (i >= 0)
+		return i;
+	if (nsrv == MAXSRV)
+		return 0;				/* out of slots: share the first */
+	cx = AllocSetContextCreate(CurrentMemoryContext, "hbase_fdw probe",
+							   ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cx);
+	c = hb_connect(o->host, o->port, o->tmo * 1000);
+	for (k = 0; k < 3; k++)
+	{
+		hb_ping(c, o->table);
+		best = Min(best, hb_last_ms(c));
+	}
+	i = nsrv++;
+	w_srv[i] = srv;
+	w_rtt[i] = best;
+	w_conn[i] = hb_conn_ms(c);
+	w_bytes[i] = w_ms[i] = 0;
+
+	sp.caching = 1000;
+	id = hb_scan_open(c, o->table, &sp);
+	n = hb_scan_next(c, id, 1000, &rows);
+	if (hb_last_in(c) > 4096 && hb_last_ms(c) > best)
+	{
+		w_bytes[i] = hb_last_in(c);
+		w_ms[i] = hb_last_ms(c) - best;
+	}
+	if (n > 0)
+		rel_seen(relid, hb_last_in(c), n);
+	hb_scan_close(c, id);
+	hb_disconnect(c);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cx);	/* also closes the socket, if not yet */
+	return i;
+}
+
+static double
+srv_rtt(int i)
+{
+	return force_rtt >= 0 ? force_rtt : w_rtt[i];
+}
+
+/* bytes per ms; until a big reply was seen, assume 1 Gbit/s */
+static double
+srv_bw(int i)
+{
+	if (force_bw > 0)
+		return force_bw * 1000.0 / 8.0;
+	if (w_ms[i] <= 0)
+		return 125000.0;
+	return w_bytes[i] / w_ms[i];
+}
+
+static int
+rel_slot(Oid relid)
+{
+	int			i;
+
+	for (i = 0; i < nrel; i++)
+		if (r_rel[i] == relid)
+			return i;
+	return -1;
+}
+
+/* bytes per row; before any scan, a guess from the number of columns */
+static double
+rel_bpr(Oid relid, int ncols)
+{
+	int			i = rel_slot(relid);
+
+	if (i < 0 || r_rows[i] <= 0)
+		return 50 + 30 * ncols;
+	return r_bytes[i] / r_rows[i];
+}
+
+static void
+rel_seen(Oid relid, double bytes, double rows)
+{
+	int			i = rel_slot(relid);
+
+	if (i < 0)
+	{
+		if (nrel == MAXREL)
+			return;
+		i = nrel++;
+		r_rel[i] = relid;
+		r_bytes[i] = r_rows[i] = 0;
+	}
+	r_bytes[i] += bytes;
+	r_rows[i] += rows;
+}
 
 /* ---------- options ---------- */
 
@@ -769,9 +928,25 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 
 	/* all quals are rechecked locally, the pushed ones too */
 	cost_qual_eval(&qc, extract_actual_clauses(clauses, false), root);
-	su = (required_outer ? 0 : HB_CONNECT_COST) + HB_RPC_COST + qc.startup;
-	tot = su + (rpcs - 1) * HB_RPC_COST +
-		fetched * (cpu_tuple_cost + HB_ROW_COST + qc.per_tuple);
+	if (adaptive)
+	{
+		int			i = find_srv(GetForeignTable(relid)->serverid, &ri->o, relid);
+		double		bpr = rel_bpr(relid, bms_num_members(ri->used)),
+					msu,
+					mtot;
+
+		msu = (required_outer ? 0 : w_conn[i]) + srv_rtt(i);
+		mtot = msu + (rpcs - 1) * srv_rtt(i) + fetched * bpr / srv_bw(i) +
+			fetched * row_us / 1000.0;
+		su = msu * cpm + qc.startup;
+		tot = mtot * cpm + qc.startup + fetched * (cpu_tuple_cost + qc.per_tuple);
+	}
+	else
+	{
+		su = (required_outer ? 0 : HB_CONNECT_COST) + HB_RPC_COST + qc.startup;
+		tot = su + (rpcs - 1) * HB_RPC_COST +
+			fetched * (cpu_tuple_cost + HB_ROW_COST + qc.per_tuple);
+	}
 
 #if PG_VERSION_NUM >= 180000
 	p = create_foreignscan_path(root, rel, NULL, rows, 0, su, tot, pk,
@@ -1028,6 +1203,7 @@ hbBeginForeignScan(ForeignScanState *node, int eflags)
 									 "hbase_fdw batch", ALLOCSET_DEFAULT_SIZES);
 	/* socket is closed by a reset callback on this (query) context */
 	st->conn = hb_connect(st->o.host, st->o.port, st->o.tmo * 1000);
+	st->wi = srv_slot(GetForeignTable(RelationGetRelid(rel))->serverid);
 }
 
 static void
@@ -1439,6 +1615,15 @@ hbIterateForeignScan(ForeignScanState *node)
 		MemoryContextSwitchTo(old);
 		st->pos = 0;
 		st->nrpc++;
+		st->nrows += st->n;
+
+		/* a big reply of whole rows tells bandwidth apart from latency */
+		if (st->wi >= 0 && !st->keyonly && hb_last_in(st->conn) > 4096 &&
+			hb_last_ms(st->conn) > w_rtt[st->wi])
+		{
+			w_bytes[st->wi] += hb_last_in(st->conn);
+			w_ms[st->wi] += hb_last_ms(st->conn) - w_rtt[st->wi];
+		}
 		if (st->n == 0 && st->open)
 		{
 			st->eof = true;
@@ -1473,6 +1658,9 @@ hbEndForeignScan(ForeignScanState *node)
 	if (st->open)
 		hb_scan_close(st->conn, st->sid);
 	st->open = false;
+	/* bytes per row, from scans big enough to tell (key-only rows are tiny) */
+	if (st->nrows >= 100 && !st->keyonly)
+		rel_seen(RelationGetRelid(st->rel), hb_bytes_in(st->conn), st->nrows);
 	hb_disconnect(st->conn);
 }
 
@@ -1557,6 +1745,50 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	}
 	if (es->analyze)
 		ExplainPropertyInteger("HBase RPCs", NULL, st->nrpc, es);
+	/* the weights the planner costed with (only with measured costs) */
+	if (adaptive && (es->verbose || es->analyze))
+	{
+		Oid			relid = RelationGetRelid(st->rel);
+		int			i = srv_slot(GetForeignTable(relid)->serverid);
+
+		if (i >= 0)
+		{
+			char		b[128];
+
+			snprintf(b, sizeof(b), "rtt %.2f ms, bandwidth %.0f Mbit/s, %.0f bytes/row",
+					 srv_rtt(i), srv_bw(i) * 8 / 1000.0,
+					 rel_bpr(relid, st->ncols));
+			ExplainPropertyText("Network", b, es);
+		}
+		if (es->analyze && st->conn)
+			ExplainPropertyInteger("Bytes Received", NULL, hb_bytes_in(st->conn), es);
+	}
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("hbase_fdw.adaptive_costs",
+							 "Cost HBase scans from the measured RTT and bandwidth.",
+							 "off: the fixed costs tuned on one machine.",
+							 &adaptive, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("hbase_fdw.rtt_ms",
+							 "Use this RTT in ms instead of measuring it (-1 = measure).",
+							 NULL, &force_rtt, -1, -1, 100000, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("hbase_fdw.bw_mbps",
+							 "Use this bandwidth in Mbit/s instead of measuring it (-1 = measure).",
+							 NULL, &force_bw, -1, -1, 1e6, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("hbase_fdw.cost_per_ms",
+							 "Planner cost units per millisecond of HBase time.",
+							 NULL, &cpm, 20.0, 0.001, 1e6, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("hbase_fdw.row_us",
+							 "Client time per fetched row, in microseconds.",
+							 NULL, &row_us, 1.0, 0, 1e6, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	MarkGUCPrefixReserved("hbase_fdw");
 }
 
 Datum

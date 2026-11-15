@@ -61,4 +61,11 @@ extern void hb_scan_close(HbConn *c, int32 id);
 extern int	hb_get_rows(HbConn *c, const char *table, const HbKey *keys,
 						int nkeys, char **cols, int ncols, HbRow **rows);
 
+/* for measured costs (Part B) */
+extern void hb_ping(HbConn *c, const char *table);
+extern double hb_last_ms(HbConn *c);	/* time of the last call, ms */
+extern long hb_last_in(HbConn *c);	/* bytes the last call received */
+extern long hb_bytes_in(HbConn *c);	/* bytes received since connect */
+extern double hb_conn_ms(HbConn *c);	/* time it took to connect, ms */
+
 #endif

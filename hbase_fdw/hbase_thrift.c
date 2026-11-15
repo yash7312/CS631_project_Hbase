@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -63,7 +64,32 @@ struct HbConn
 	int			il,
 				ip;
 	MemoryContextCallback cb;
+
+	/* for measured costs: bytes received, and how long the last call took */
+	long		nin;			/* bytes received since connect */
+	double		t0;				/* when the current call started (ms) */
+	long		n0;				/* nin when it started */
+	double		lastms;			/* the last call: time, bytes received */
+	long		lastin;
+	double		connms;			/* time to connect */
 };
+
+static double
+now_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* a call's reply is fully read: note its time and size */
+static void
+done(HbConn *c)
+{
+	c->lastms = now_ms() - c->t0;
+	c->lastin = c->nin - c->n0;
+}
 
 static void
 hb_fail(HbConn *c, const char *what)
@@ -137,6 +163,7 @@ hb_connect(const char *host, int port, int tmo)
 	char		ps[16];
 	int			r,
 				one = 1;
+	double		t = now_ms();
 
 	c->fd = -1;
 	c->tmo = tmo;
@@ -193,6 +220,7 @@ hb_connect(const char *host, int port, int tmo)
 		hb_fail(c, "could not connect to HBase thrift server");
 
 	setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	c->connms = now_ms() - t;
 	return c;
 }
 
@@ -251,6 +279,8 @@ wmsg(HbConn *c, const char *name)
 				 errmsg("hbase_fdw: connection to %s:%d is closed",
 						c->host, c->port)));
 	resetStringInfo(&c->ob);
+	c->t0 = now_ms();
+	c->n0 = c->nin;
 	w32(c, (int32) (VER1 | M_CALL));
 	wstr(c, name, strlen(name));
 	w32(c, ++c->seq);
@@ -307,6 +337,7 @@ rd(HbConn *c, void *dst, int n)
 					hb_fail(c, "could not read from HBase thrift server");
 			}
 			c->il = r;
+			c->nin += r;
 		}
 		k = Min(n, c->il - c->ip);
 		memcpy(d, c->ib + c->ip, k);
@@ -735,7 +766,9 @@ hb_scan_next(HbConn *c, int32 sid, int n, HbRow **out)
 	flush(c);
 
 	rmsg(c, fn);
-	return rrows(c, fn, out);
+	n = rrows(c, fn, out);
+	done(c);
+	return n;
 }
 
 /*
@@ -770,7 +803,9 @@ hb_get_rows(HbConn *c, const char *tab, const HbKey *keys, int nkeys,
 	flush(c);
 
 	rmsg(c, fn);
-	return rrows(c, fn, out);
+	i = rrows(c, fn, out);
+	done(c);
+	return i;
 }
 
 void
@@ -796,3 +831,34 @@ hb_scan_close(HbConn *c, int32 sid)
 			skip(c, ft, 0);
 	}
 }
+
+/* isTableEnabled: a tiny reply whatever the table's size, to time one RTT */
+void
+hb_ping(HbConn *c, const char *tab)
+{
+	static const char *fn = "isTableEnabled";
+	int			ft;
+
+	wmsg(c, fn);
+	wfld(c, T_STRING, 1);
+	wstr(c, tab, strlen(tab));
+	w8(c, T_STOP);
+	flush(c);
+
+	rmsg(c, fn);
+	while ((ft = r8(c)) != T_STOP)
+	{
+		int			fid = r16(c);
+
+		if (fid == 1 && ft == T_STRUCT)
+			rexc(c, fn, 1);
+		else
+			skip(c, ft, 0);		/* field 0: the bool */
+	}
+	done(c);
+}
+
+double		hb_last_ms(HbConn *c) { return c->lastms; }
+long		hb_last_in(HbConn *c) { return c->lastin; }
+long		hb_bytes_in(HbConn *c) { return c->nin; }
+double		hb_conn_ms(HbConn *c) { return c->connms; }
