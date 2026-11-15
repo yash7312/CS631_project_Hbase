@@ -16,3 +16,4 @@ hbase_fdw/tmp_check/
 
 __pycache__/
 *.pyc
+tmp/
