@@ -3,7 +3,8 @@
 #   python3 test/sweep.py [out.csv]        (proxy running and server hb on 9190)
 #
 # For each RTT, bandwidth and outer size n it times the join with each plan
-# forced: nl (nested loop of gets), hash (hash join over a full scan) and
+# forced: nl (one get per outer row: full HBase scans are disabled, so the
+# loop cannot be flipped round a full scan), hash (hash join over a full scan) and
 # batch (the batched join). Then it asks the planner what it picks under
 #   static   - fixed costs, no batched join
 #   measured - measured costs, no batched join
@@ -22,7 +23,8 @@ RUNS = 3
 Q = ("SELECT count(e.name) FROM (SELECT emp_id FROM ord1k LIMIT %d) o "
      "JOIN emp e ON e.id = o.emp_id")
 OFF = "SET hbase_fdw.batch_join = off; "
-FORCE = {"nl": OFF + "SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;",
+FORCE = {"nl": OFF + "SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off; "
+               "SET hbase_fdw.enable_full_scan = off;",
          "hash": OFF + "SET enable_nestloop = off; SET enable_mergejoin = off;",
          "batch": "SET enable_nestloop = off; SET enable_hashjoin = off; SET enable_mergejoin = off;"}
 MODEL = {"static": OFF + "SET hbase_fdw.adaptive_costs = off;",
@@ -73,6 +75,11 @@ for r in RTTS:
         ctl("bw", b)
         for n in NS:
             q = Q % n
+            for m, sets in FORCE.items():          # each forced plan is what it says
+                got = method(explain(sets, q, False)["Plan"])
+                if got != m:
+                    print("WARNING: forced %s gave %s at rtt %d bw %d n %d" % (m, got, r, b, n),
+                          flush=True)
             t = {m: timed(s, q) for m, s in FORCE.items()}
             for model, sets in MODEL.items():
                 m = method(explain(sets, q, False)["Plan"])

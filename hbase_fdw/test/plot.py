@@ -75,7 +75,7 @@ for x in r:
 ns = sorted({int(x["n"]) for x in r})
 fig, axs = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
 for ax, rtt in zip(axs, (5, 20)):
-    for i, (col, name) in enumerate(((ORANGE, "nested loop (best Postgres finds)"),
+    for i, (col, name) in enumerate(((ORANGE, "one get per outer row"),
                                      (MUTED, "hash join over a full scan"),
                                      (BLUE, "batched join"))):
         ys = [t[(rtt, 0, n)][i] for n in ns]
@@ -88,9 +88,7 @@ axs[0].set_ylabel("Join time (ms, log)")
 axs[0].legend(loc="upper left")
 fig.suptitle("The batched join is fastest from 10 outer rows up", x=0.01, ha="left",
              fontsize=11, color=INK)
-fig.text(0.01, 0.01, "Nested loop: hash and merge joins off. Up to ~30 rows it is one get per outer row; "
-         "past that Postgres picks other loop shapes.", fontsize=7.5, color=MUTED)
-fig.tight_layout(rect=(0, 0.04, 1, 1))
+fig.tight_layout()
 fig.savefig(os.path.join(D, "fig2_join_time.png"), dpi=200)
 plt.close(fig)
 print("wrote", os.path.join(D, "fig2_join_time.png"))

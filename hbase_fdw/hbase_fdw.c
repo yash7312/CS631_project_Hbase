@@ -107,6 +107,9 @@ static double row_us = 1.0;		/* client time per row, microseconds */
 
 /* batched join (Part C) */
 static bool batch_join = true;
+
+/* for experiments, like enable_seqscan: off marks full HBase scans disabled */
+static bool full_scan = true;
 static int	join_batch = 500;	/* outer rows per batch, K */
 
 typedef struct Opt
@@ -1003,6 +1006,8 @@ key_pathkeys(PlannerInfo *root, RelOptInfo *rel, Oid relid, AttrNumber katt)
  * and closes; a get fetches batch_size keys per call), shipping each row,
  * and the local quals on each row.
  */
+static bool is_full_scan(RelOptInfo *rel, HbRelInfo *ri, List *clauses);
+
 static void
 add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 			Relids required_outer)
@@ -1011,7 +1016,8 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 	double		rows,
 				fetched,
 				rpcs;
-	bool		get;
+	bool		get,
+				dis;
 	QualCost	qc;
 	Cost		su,
 				tot;
@@ -1046,9 +1052,19 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 			fetched * (cpu_tuple_cost + HB_ROW_COST + qc.per_tuple);
 	}
 
+	/* hbase_fdw.enable_full_scan = off: disabled, as enable_seqscan does */
+	dis = !full_scan && is_full_scan(rel, ri, clauses);
 #if PG_VERSION_NUM >= 180000
-	p = create_foreignscan_path(root, rel, NULL, rows, 0, su, tot, pk,
+	p = create_foreignscan_path(root, rel, NULL, rows, dis ? 1 : 0, su, tot, pk,
 								required_outer, NULL, NIL, NIL);
+#else
+	if (dis)
+	{
+		su += disable_cost;
+		tot += disable_cost;
+	}
+#endif
+#if PG_VERSION_NUM >= 180000
 #elif PG_VERSION_NUM >= 170000
 	p = create_foreignscan_path(root, rel, NULL, rows, su, tot, pk,
 								required_outer, NULL, NIL, NIL);
@@ -1057,6 +1073,19 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 								required_outer, NULL, NIL);
 #endif
 	add_path(rel, (Path *) p);
+}
+
+/* does this path read the whole table (no row-key condition at all)? */
+static bool
+is_full_scan(RelOptInfo *rel, HbRelInfo *ri, List *clauses)
+{
+	List	   *kx = NIL,
+			   *ko = NIL;
+
+	if (ri->katt == InvalidAttrNumber)
+		return true;
+	key_conds(rel, ri->katt, clauses, &kx, &ko, NULL);
+	return kx == NIL;
 }
 
 /* generate_implied_equalities_for_column callback: our rowkey? */
@@ -2486,6 +2515,9 @@ _PG_init(void)
 							 "Client time per fetched row, in microseconds.",
 							 NULL, &row_us, 1.0, 0, 1e6, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("hbase_fdw.enable_full_scan",
+							 "For experiments: off marks full HBase scans disabled, like enable_seqscan.",
+							 NULL, &full_scan, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("hbase_fdw.batch_join",
 							 "Offer a batched join that fetches K outer keys per HBase call.",
 							 NULL, &batch_join, true, PGC_USERSET, 0, NULL, NULL, NULL);
