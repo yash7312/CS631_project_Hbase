@@ -7,7 +7,8 @@
 # planner which plan it picks with static and with measured costs. Writes
 #   rtt, bw, n, model, chosen, ms, nl_ms, hash_ms, regret
 # where ms is the forced time of the chosen plan and regret = ms / best
-# (1.0 = the planner picked the faster plan). Every psql call is a new
+# (1.0 = the planner picked the faster plan). Forced nl turns off Materialize,
+# so it is a nested loop of gets; a plan that was not forced is timed as chosen. Every psql call is a new
 # session, so measured costs re-probe the network each time.
 import json, subprocess, sys, csv, statistics
 
@@ -17,7 +18,7 @@ NS = [1, 10, 15, 20, 25, 30, 40, 100, 300]         # outer rows
 RUNS = 3
 Q = ("SELECT count(e.name) FROM (SELECT emp_id FROM ord1k LIMIT %d) o "
      "JOIN emp e ON e.id = o.emp_id")
-FORCE = {"nl": "SET enable_hashjoin = off; SET enable_mergejoin = off;",
+FORCE = {"nl": "SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;",
          "hash": "SET enable_nestloop = off; SET enable_mergejoin = off;"}
 MODEL = {"static": "SET hbase_fdw.adaptive_costs = off;",
          "measured": "SET hbase_fdw.adaptive_costs = on;"}
@@ -33,10 +34,16 @@ def explain(sets, q, analyze):
                          check=True, capture_output=True, text=True).stdout
     return json.loads(out)[0]
 
+def has(node, t):
+    return node["Node Type"] == t or any(has(c, t) for c in node.get("Plans", []))
+
 def method(node):
+    # nl = nested loop of gets; nlmat = nested loop over a materialized full scan
     t = node["Node Type"]
-    if t in ("Nested Loop", "Hash Join", "Merge Join"):
-        return {"Nested Loop": "nl", "Hash Join": "hash", "Merge Join": "merge"}[t]
+    if t == "Nested Loop":
+        return "nlmat" if has(node, "Materialize") else "nl"
+    if t in ("Hash Join", "Merge Join"):
+        return {"Hash Join": "hash", "Merge Join": "merge"}[t]
     for c in node.get("Plans", []):
         m = method(c)
         if m:
@@ -57,10 +64,12 @@ for r in RTTS:
         for n in NS:
             q = Q % n
             t = {m: timed(s, q) for m, s in FORCE.items()}
-            best = min(t.values())
             for model, sets in MODEL.items():
                 m = method(explain(sets, q, False)["Plan"])
-                ms = t.get(m, float("nan"))
+                if m not in t:                     # a plan we did not force: time it as is
+                    t[m] = timed(sets, q)
+                ms = t[m]
+                best = min(t.values())
                 row = [r, b, n, model, m, round(ms, 2), round(t["nl"], 2),
                        round(t["hash"], 2), round(ms / best, 2)]
                 w.writerow(row)

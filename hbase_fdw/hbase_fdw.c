@@ -205,6 +205,7 @@ typedef struct HbState
 				pos;
 	long		nrpc;			/* scannerGetList + getRowsWithColumns calls */
 	long		nrows;			/* rows fetched from HBase */
+	double		ncell;			/* and their cells, the key counted as one */
 	int			wi;				/* slot in the weight arrays, -1 = none yet */
 
 	/* for error context */
@@ -219,17 +220,18 @@ typedef struct HbState
 #define MAXSRV 16
 static int	nsrv = 0;
 static Oid	w_srv[MAXSRV];
-static double w_rtt[MAXSRV];	/* ms */
+static double w_rtt[MAXSRV];	/* ms: best ping, the bare network round trip */
+static double w_call[MAXSRV];	/* ms: best 1-key get, round trip + HBase work */
 static double w_conn[MAXSRV];	/* ms */
 static double w_bytes[MAXSRV];	/* bytes in big replies ... */
-static double w_ms[MAXSRV];		/* ... and their time beyond one rtt */
+static double w_ms[MAXSRV];		/* ... and their time beyond one call */
 
-/* per foreign table: bytes per row seen in real scans */
+/* per foreign table: bytes per cell (the row key counts as a cell) */
 #define MAXREL 64
 static int	nrel = 0;
 static Oid	r_rel[MAXREL];
 static double r_bytes[MAXREL];
-static double r_rows[MAXREL];
+static double r_cells[MAXREL];
 
 /* slot of a server already measured, or -1 */
 static int
@@ -243,24 +245,44 @@ srv_slot(Oid srv)
 	return -1;
 }
 
-static void rel_seen(Oid relid, double bytes, double rows);
+/* cells in a batch of rows, the key counted as one */
+static double
+ncells(HbRow *r, int n)
+{
+	double		t = 0;
+	int			k;
+
+	for (k = 0; k < n; k++)
+		t += r[k].ncells + 1;
+	return t;
+}
+
+static void rel_seen(Oid relid, double bytes, double cells);
 
 /*
  * Slot of a server, measuring it the first time in this session:
- * connect, best of 3 pings = rtt, then one batch of up to 1000 whole rows
- * of this table for bandwidth and bytes per row. About 5 round trips, once.
+ *  - best of 3 pings = rtt (reported; bare network)
+ *  - best of 2 one-key gets = the cost of a call (what every RPC really pays)
+ *  - the 2nd batch of up to 1000 whole rows = bandwidth and bytes per cell
+ *    (the 1st batch also pays for HBase warming up its scanner)
+ * About 8 round trips, once per session.
  */
 static int
 find_srv(Oid srv, HbOpts *o, Oid relid)
 {
 	int			i = srv_slot(srv),
 				k,
-				n;
+				n,
+				m;
 	HbConn	   *c;
 	HbScanSpec	sp = {0};
-	HbRow	   *rows;
+	HbRow	   *r1,
+			   *r2;
+	HbKey		key;
 	int32		id;
-	double		best = 1e9;
+	double		in,
+				ms,
+				cl;
 	MemoryContext cx,
 				old;
 
@@ -272,38 +294,63 @@ find_srv(Oid srv, HbOpts *o, Oid relid)
 							   ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(cx);
 	c = hb_connect(o->host, o->port, o->tmo * 1000);
+	i = nsrv++;
+	w_srv[i] = srv;
+	w_conn[i] = hb_conn_ms(c);
+	w_rtt[i] = w_call[i] = 1e9;
+	w_bytes[i] = w_ms[i] = 0;
 	for (k = 0; k < 3; k++)
 	{
 		hb_ping(c, o->table);
-		best = Min(best, hb_last_ms(c));
+		w_rtt[i] = Min(w_rtt[i], hb_last_ms(c));
 	}
-	i = nsrv++;
-	w_srv[i] = srv;
-	w_rtt[i] = best;
-	w_conn[i] = hb_conn_ms(c);
-	w_bytes[i] = w_ms[i] = 0;
 
 	sp.caching = 1000;
 	id = hb_scan_open(c, o->table, &sp);
-	n = hb_scan_next(c, id, 1000, &rows);
-	if (hb_last_in(c) > 4096 && hb_last_ms(c) > best)
+	n = hb_scan_next(c, id, 1000, &r1);
+	in = hb_last_in(c);
+	ms = hb_last_ms(c);
+	cl = ncells(r1, n);
+	m = n == 1000 ? hb_scan_next(c, id, 1000, &r2) : 0;
+	if (m > 0)
 	{
-		w_bytes[i] = hb_last_in(c);
-		w_ms[i] = hb_last_ms(c) - best;
+		in = hb_last_in(c);
+		ms = hb_last_ms(c);
+		cl = ncells(r2, m);
 	}
-	if (n > 0)
-		rel_seen(relid, hb_last_in(c), n);
 	hb_scan_close(c, id);
+
+	if (n > 0)
+	{
+		key.p = r1[0].key;
+		key.len = r1[0].keylen;
+		for (k = 0; k < 2; k++)
+		{
+			hb_get_rows(c, o->table, &key, 1, NULL, 0, &r2);
+			w_call[i] = Min(w_call[i], hb_last_ms(c));
+		}
+		rel_seen(relid, in, cl);
+	}
+	else
+		w_call[i] = w_rtt[i];
+	if (in > 4096 && ms > w_call[i])
+	{
+		w_bytes[i] = in;
+		w_ms[i] = ms - w_call[i];
+	}
 	hb_disconnect(c);
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cx);	/* also closes the socket, if not yet */
 	return i;
 }
 
+/* ms one RPC costs; with a forced rtt, that rtt plus HBase's own work */
 static double
-srv_rtt(int i)
+srv_call(int i)
 {
-	return force_rtt >= 0 ? force_rtt : w_rtt[i];
+	if (force_rtt >= 0)
+		return force_rtt + Max(0, w_call[i] - w_rtt[i]);
+	return w_call[i];
 }
 
 /* bytes per ms; until a big reply was seen, assume 1 Gbit/s */
@@ -328,32 +375,34 @@ rel_slot(Oid relid)
 	return -1;
 }
 
-/* bytes per row; before any scan, a guess from the number of columns */
+/* bytes per cell; 30 until a scan has been seen */
 static double
-rel_bpr(Oid relid, int ncols)
+rel_bpc(Oid relid)
 {
 	int			i = rel_slot(relid);
 
-	if (i < 0 || r_rows[i] <= 0)
-		return 50 + 30 * ncols;
-	return r_bytes[i] / r_rows[i];
+	if (i < 0 || r_cells[i] <= 0)
+		return 30;
+	return r_bytes[i] / r_cells[i];
 }
 
 static void
-rel_seen(Oid relid, double bytes, double rows)
+rel_seen(Oid relid, double bytes, double cells)
 {
 	int			i = rel_slot(relid);
 
+	if (cells <= 0)
+		return;
 	if (i < 0)
 	{
 		if (nrel == MAXREL)
 			return;
 		i = nrel++;
 		r_rel[i] = relid;
-		r_bytes[i] = r_rows[i] = 0;
+		r_bytes[i] = r_cells[i] = 0;
 	}
 	r_bytes[i] += bytes;
-	r_rows[i] += rows;
+	r_cells[i] += cells;
 }
 
 /* ---------- options ---------- */
@@ -931,12 +980,13 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 	if (adaptive)
 	{
 		int			i = find_srv(GetForeignTable(relid)->serverid, &ri->o, relid);
-		double		bpr = rel_bpr(relid, bms_num_members(ri->used)),
+		/* bytes per row = cells fetched (key + used columns) * bytes per cell */
+		double		bpr = Max(1, bms_num_members(ri->used)) * rel_bpc(relid),
 					msu,
 					mtot;
 
-		msu = (required_outer ? 0 : w_conn[i]) + srv_rtt(i);
-		mtot = msu + (rpcs - 1) * srv_rtt(i) + fetched * bpr / srv_bw(i) +
+		msu = (required_outer ? 0 : w_conn[i]) + srv_call(i);
+		mtot = msu + (rpcs - 1) * srv_call(i) + fetched * bpr / srv_bw(i) +
 			fetched * row_us / 1000.0;
 		su = msu * cpm + qc.startup;
 		tot = mtot * cpm + qc.startup + fetched * (cpu_tuple_cost + qc.per_tuple);
@@ -1616,13 +1666,14 @@ hbIterateForeignScan(ForeignScanState *node)
 		st->pos = 0;
 		st->nrpc++;
 		st->nrows += st->n;
+		st->ncell += ncells(st->rows, st->n);
 
 		/* a big reply of whole rows tells bandwidth apart from latency */
 		if (st->wi >= 0 && !st->keyonly && hb_last_in(st->conn) > 4096 &&
-			hb_last_ms(st->conn) > w_rtt[st->wi])
+			hb_last_ms(st->conn) > w_call[st->wi])
 		{
 			w_bytes[st->wi] += hb_last_in(st->conn);
-			w_ms[st->wi] += hb_last_ms(st->conn) - w_rtt[st->wi];
+			w_ms[st->wi] += hb_last_ms(st->conn) - w_call[st->wi];
 		}
 		if (st->n == 0 && st->open)
 		{
@@ -1658,9 +1709,9 @@ hbEndForeignScan(ForeignScanState *node)
 	if (st->open)
 		hb_scan_close(st->conn, st->sid);
 	st->open = false;
-	/* bytes per row, from scans big enough to tell (key-only rows are tiny) */
+	/* bytes per cell, from scans big enough to tell (key-only rows are tiny) */
 	if (st->nrows >= 100 && !st->keyonly)
-		rel_seen(RelationGetRelid(st->rel), hb_bytes_in(st->conn), st->nrows);
+		rel_seen(RelationGetRelid(st->rel), hb_bytes_in(st->conn), st->ncell);
 	hb_disconnect(st->conn);
 }
 
@@ -1753,11 +1804,11 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 		if (i >= 0)
 		{
-			char		b[128];
+			char		b[160];
 
-			snprintf(b, sizeof(b), "rtt %.2f ms, bandwidth %.0f Mbit/s, %.0f bytes/row",
-					 srv_rtt(i), srv_bw(i) * 8 / 1000.0,
-					 rel_bpr(relid, st->ncols));
+			snprintf(b, sizeof(b), "rtt %.2f ms, call %.2f ms, bandwidth %.0f Mbit/s, %.0f bytes/cell",
+					 force_rtt >= 0 ? force_rtt : w_rtt[i], srv_call(i),
+					 srv_bw(i) * 8 / 1000.0, rel_bpc(relid));
 			ExplainPropertyText("Network", b, es);
 		}
 		if (es->analyze && st->conn)
