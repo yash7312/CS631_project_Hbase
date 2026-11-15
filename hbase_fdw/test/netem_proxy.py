@@ -10,6 +10,7 @@ LISTEN, TARGET_HOST, TARGET_PORT, CTL = 9190, "127.0.0.1", 9090, 9191
 set_ = {"rtt": 0.0, "bw": 0.0, "jit": 0.0}            # ms, Mbit/s (0 = unlimited), ms
 st = {"up": 0, "down": 0, "upn": 0, "downn": 0, "conns": 0}
 mu = threading.Lock()
+SPIN = 0.002                                           # seconds of busy-wait before each release
 
 def reader(src, q, name):
     last = 0.0
@@ -35,10 +36,10 @@ def writer(dst, q):
     while True:
         rel, d = q.get()                               # blocks until a chunk is queued
         w = rel - time.time()
-        if w > 0.0002:
-            time.sleep(w - 0.0002)                     # sleep overshoots a little, so stop early
-        while time.time() < rel:
-            pass                                       # spin the last 0.2 ms
+        if w > SPIN:
+            time.sleep(w - SPIN)                       # a laptop CPU wakes late from a long sleep,
+        while time.time() < rel:                       # so stop early and spin the rest,
+            time.sleep(0)                              # letting the other threads run
         if not d:
             try:
                 dst.shutdown(socket.SHUT_WR)

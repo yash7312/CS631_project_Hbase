@@ -86,9 +86,10 @@ init_pg() {
 }
 
 start_pg() {
-	"$(pgbin pg_ctl)" -D "$W/pgdata" status >/dev/null 2>&1 && return
-	say "PostgreSQL: start"
-	"$(pgbin pg_ctl)" -D "$W/pgdata" -l "$W/pgdata/logfile" -w start >/dev/null
+	if ! "$(pgbin pg_ctl)" -D "$W/pgdata" status >/dev/null 2>&1; then
+		say "PostgreSQL: start"
+		"$(pgbin pg_ctl)" -D "$W/pgdata" -l "$W/pgdata/logfile" -w start >/dev/null
+	fi
 	"$(pgbin psql)" -p "$PGPORT" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'test'" | grep -q 1 ||
 		"$(pgbin createdb)" -p "$PGPORT" test
 }
