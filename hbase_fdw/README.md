@@ -356,7 +356,7 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
 3 × (20 batches + 1 empty) = 63.
 
 ### Limitations
-- Read-only; reads the latest version of each cell only.
+- Reads the latest version of each cell only.
 - **Collations.**
   - Ranges are pushed only for bytea or C-collated text (see above).
   - Non-deterministic (ICU) collations are handled by the code but untested:
@@ -366,9 +366,16 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
     LIKE estimates are default guesses.
   - Join size estimates on the key are poor (Postgres assumes 200 distinct
     keys), though the path choice is still right.
-- **Nested-loop joins.** A parameterized lookup is 1 RPC per outer row; keys
-  are not batched across outer rows. For large outer sides the planner
-  uses a hash join over one full scan instead.
+- **Joins.** A parameterized lookup is 1 RPC per outer row. For an inner
+  join on the row key, the batched join (`hbase_fdw.batch_join`) fetches K
+  outer keys per call instead; LEFT JOIN is not batched yet.
+- **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
+  - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
+  - No rollback: each row is written to HBase at once, so `ROLLBACK` does
+    not undo it, and a failing statement keeps the rows written before it.
+  - UPDATE cannot change the row key (delete and insert instead); setting a
+    column to NULL deletes its cell; a row with no cells left disappears.
+  - `DELETE ... RETURNING` returns no column values.
 - **Not used for:** `DESC` order (an HBase reversed scan would do it), and
   `NOT IN` / `<>`.
 - **Connections and scanners.**

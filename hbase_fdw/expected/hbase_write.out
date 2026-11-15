@@ -1,0 +1,126 @@
+-- INSERT, UPDATE, DELETE into HBase. Uses only keys starting with 'w' and
+-- removes them again, so the other tests' data is untouched.
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS hbase_fdw CASCADE;
+CREATE EXTENSION hbase_fdw;
+RESET client_min_messages;
+SET hbase_fdw.adaptive_costs = off;
+CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
+  OPTIONS (host 'localhost', port '9090');
+CREATE FOREIGN TABLE emp (
+  id     text OPTIONS (rowkey 'true') COLLATE "C",
+  name   text OPTIONS (column 'info:name') NOT NULL,
+  dept   text OPTIONS (column 'info:dept'),
+  salary int  OPTIONS (column 'pay:salary')
+) SERVER hb OPTIONS (table 'emp', rows '10000');
+DELETE FROM emp WHERE id LIKE 'w%';   -- leftovers of an earlier failed run
+-- insert, then read back
+INSERT INTO emp VALUES ('w000001', 'wendy', 'eng', 100), ('w000002', 'will', NULL, 200);
+SELECT * FROM emp WHERE id LIKE 'w%' ORDER BY id;
+   id    | name  | dept | salary 
+---------+-------+------+--------
+ w000001 | wendy | eng  |    100
+ w000002 | will  |      |    200
+(2 rows)
+
+INSERT INTO emp VALUES ('w000003', 'wu', 'ops', 300) RETURNING id, name;
+   id    | name 
+---------+------
+ w000003 | wu
+(1 row)
+
+-- the key must be there
+INSERT INTO emp VALUES (NULL, 'nobody', 'x', 1);
+ERROR:  HBase row key cannot be NULL
+INSERT INTO emp VALUES ('', 'nobody', 'x', 1);
+ERROR:  HBase row key cannot be empty
+-- an existing key is overwritten: HBase puts are upserts
+INSERT INTO emp VALUES ('w000001', 'wendy2', 'ops', 101);
+SELECT * FROM emp WHERE id = 'w000001';
+   id    |  name  | dept | salary 
+---------+--------+------+--------
+ w000001 | wendy2 | ops  |    101
+(1 row)
+
+-- update one column; the others stay
+EXPLAIN (COSTS OFF) UPDATE emp SET salary = 7 WHERE id = 'w000001';
+                   QUERY PLAN                   
+------------------------------------------------
+ Update on emp
+   ->  Foreign Scan on emp
+         Filter: (id = 'w000001'::text)
+         HBase Table: emp
+         HBase Key Cond: (id = 'w000001'::text)
+(5 rows)
+
+UPDATE emp SET salary = 7 WHERE id = 'w000001';
+SELECT * FROM emp WHERE id = 'w000001';
+   id    |  name  | dept | salary 
+---------+--------+------+--------
+ w000001 | wendy2 | ops  |      7
+(1 row)
+
+-- setting a column to NULL deletes its cell
+UPDATE emp SET dept = NULL WHERE id = 'w000003';
+SELECT * FROM emp WHERE id = 'w000003';
+   id    | name | dept | salary 
+---------+------+------+--------
+ w000003 | wu   |      |    300
+(1 row)
+
+-- the row key cannot change
+UPDATE emp SET id = 'w000009' WHERE id = 'w000001';
+ERROR:  cannot update the row key of HBase table "emp"
+HINT:  Delete the row and insert it with the new key.
+-- update and delete by range: the scan finds the keys
+UPDATE emp SET salary = salary + 1 WHERE id LIKE 'w%';
+SELECT id, salary FROM emp WHERE id LIKE 'w%' ORDER BY id;
+   id    | salary 
+---------+--------
+ w000001 |      8
+ w000002 |    201
+ w000003 |    301
+(3 rows)
+
+DELETE FROM emp WHERE id = 'w000002';
+SELECT id FROM emp WHERE id LIKE 'w%' ORDER BY id;
+   id    
+---------
+ w000001
+ w000003
+(2 rows)
+
+DELETE FROM emp WHERE id LIKE 'w%';
+SELECT count(*) FROM emp WHERE id LIKE 'w%';
+ count 
+-------
+     0
+(1 row)
+
+-- 1000 rows in one statement, then gone again
+INSERT INTO emp SELECT 'w' || lpad(g::text, 6, '0'), 'n' || g, 'd' || (g % 7), g
+  FROM generate_series(1, 1000) g;
+SELECT count(*), sum(salary) FROM emp WHERE id LIKE 'w%';
+ count |  sum   
+-------+--------
+  1000 | 500500
+(1 row)
+
+DELETE FROM emp WHERE id LIKE 'w%';
+SELECT count(*) FROM emp WHERE id LIKE 'w%';
+ count 
+-------
+     0
+(1 row)
+
+-- the original data is untouched
+SELECT count(*) FROM emp;
+ count 
+-------
+ 10000
+(1 row)
+
+DROP EXTENSION hbase_fdw CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to server hb
+drop cascades to foreign table emp

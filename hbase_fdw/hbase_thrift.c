@@ -832,6 +832,84 @@ hb_scan_close(HbConn *c, int32 sid)
 	}
 }
 
+/* ---------- writes (Part D) ---------- */
+
+/* a void reply: field 1/2 = IOError / IllegalArgument, stop = done */
+static void
+void_reply(HbConn *c, const char *fn)
+{
+	int			ft;
+
+	rmsg(c, fn);
+	while ((ft = r8(c)) != T_STOP)
+	{
+		int			fid = r16(c);
+
+		if ((fid == 1 || fid == 2) && ft == T_STRUCT)
+			rexc(c, fn, fid);
+		else
+			skip(c, ft, 0);
+	}
+	done(c);
+}
+
+/* mutateRow: puts and cell deletes on one row, applied at once by HBase */
+void
+hb_mutate_row(HbConn *c, const char *tab, const char *key, int klen, HbMut *m, int n)
+{
+	static const char *fn = "mutateRow";
+	int			i;
+
+	wmsg(c, fn);
+	wfld(c, T_STRING, 1);
+	wstr(c, tab, strlen(tab));
+	wfld(c, T_STRING, 2);
+	wstr(c, key, klen);
+	wfld(c, T_LIST, 3);
+	w8(c, T_STRUCT);
+	w32(c, n);
+	for (i = 0; i < n; i++)
+	{
+		wfld(c, T_BOOL, 1);
+		w8(c, m[i].del ? 1 : 0);
+		wfld(c, T_STRING, 2);
+		wstr(c, m[i].col, strlen(m[i].col));
+		if (!m[i].del)
+		{
+			wfld(c, T_STRING, 3);
+			wstr(c, m[i].val, m[i].vlen);
+		}
+		w8(c, T_STOP);			/* end of one Mutation */
+	}
+	wfld(c, T_MAP, 4);			/* attributes: empty */
+	w8(c, T_STRING);
+	w8(c, T_STRING);
+	w32(c, 0);
+	w8(c, T_STOP);
+	flush(c);
+	void_reply(c, fn);
+}
+
+/* deleteAllRow: every cell of one row */
+void
+hb_delete_row(HbConn *c, const char *tab, const char *key, int klen)
+{
+	static const char *fn = "deleteAllRow";
+
+	wmsg(c, fn);
+	wfld(c, T_STRING, 1);
+	wstr(c, tab, strlen(tab));
+	wfld(c, T_STRING, 2);
+	wstr(c, key, klen);
+	wfld(c, T_MAP, 3);			/* attributes: empty */
+	w8(c, T_STRING);
+	w8(c, T_STRING);
+	w32(c, 0);
+	w8(c, T_STOP);
+	flush(c);
+	void_reply(c, fn);
+}
+
 /* isTableEnabled: a tiny reply whatever the table's size, to time one RTT */
 void
 hb_ping(HbConn *c, const char *tab)

@@ -92,6 +92,12 @@ class Handler:
                 del t.rows[row]
                 t.keys.remove(row)
 
+    def deleteAllRow(self, name, row, attrs):
+        t, row = self._tab(name), b(row)
+        with self.mu:
+            if t.rows.pop(row, None) is not None:
+                t.keys.remove(row)
+
     def mutateRows(self, name, batches, attrs):
         for bt in batches:
             self.mutateRow(name, bt.row, bt.mutations, attrs)

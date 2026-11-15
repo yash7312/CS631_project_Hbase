@@ -44,8 +44,10 @@
 #include "executor/executor.h"
 #include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/inherit.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -2390,6 +2392,265 @@ _PG_init(void)
 	bj_init();
 }
 
+/* ---------- INSERT, UPDATE, DELETE (Part D) ---------- */
+
+/*
+ * Writes go straight to HBase: INSERT and UPDATE become one mutateRow per
+ * row (a value is a put, NULL deletes the cell), DELETE one deleteAllRow.
+ * The row key is the row's identity: UPDATE and DELETE find it in a junk
+ * column "hbase_key" that the scan below them carries up. HBase applies
+ * each call at once, so there is no rollback, and an INSERT of a key that
+ * exists overwrites it (an upsert).
+ */
+typedef struct HbMod
+{
+	HbOpts		o;
+	HbConn	   *conn;
+	AttrNumber	katt;			/* row key column */
+	AttrNumber	junk;			/* "hbase_key" in the subplan's output */
+	int			n;				/* columns written */
+	AttrNumber *att;
+	char	  **spec;			/* their "cf:q" */
+	bool	   *raw;			/* bytea: write the bytes as they are */
+	FmgrInfo   *out;			/* otherwise: the text form */
+	bool		kraw;
+	FmgrInfo	kout;
+	HbMut	   *m;
+} HbMod;
+
+static int
+hbIsForeignRelUpdatable(Relation rel)
+{
+	if (rowkey_att(RelationGetRelid(rel)) == InvalidAttrNumber)
+		return 0;
+	return (1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE);
+}
+
+static void
+hbAddForeignUpdateTargets(PlannerInfo *root, Index rtindex,
+						  RangeTblEntry *rte, Relation rel)
+{
+	AttrNumber	k = rowkey_att(RelationGetRelid(rel));
+	Form_pg_attribute a;
+
+	if (k == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("foreign table \"%s\" needs a rowkey column to be updated",
+						RelationGetRelationName(rel))));
+	a = TupleDescAttr(RelationGetDescr(rel), k - 1);
+	add_row_identity_var(root, makeVar(rtindex, k, a->atttypid, a->atttypmod,
+									   a->attcollation, 0),
+						 rtindex, "hbase_key");
+}
+
+/* the columns to write: all of them for INSERT, the SET ones for UPDATE */
+static List *
+hbPlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index rti, int i)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rti, root);
+	Relation	rel = table_open(rte->relid, NoLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	AttrNumber	k = rowkey_att(rte->relid);
+	List	   *atts = NIL;
+	int			a;
+
+	if (plan->operation == CMD_INSERT)
+	{
+		for (a = 0; a < td->natts; a++)
+			if (!TupleDescAttr(td, a)->attisdropped)
+				atts = lappend_int(atts, a + 1);
+	}
+	else if (plan->operation == CMD_UPDATE)
+	{
+		Bitmapset  *upd = get_rel_all_updated_cols(root, find_base_rel(root, rti));
+		int			c = -1;
+
+		while ((c = bms_next_member(upd, c)) >= 0)
+		{
+			a = c + FirstLowInvalidHeapAttributeNumber;
+			if (a <= 0)
+				continue;
+			if (a == k)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot update the row key of HBase table \"%s\"",
+								RelationGetRelationName(rel)),
+						 errhint("Delete the row and insert it with the new key.")));
+			atts = lappend_int(atts, a);
+		}
+	}
+	table_close(rel, NoLock);
+	return list_make1(atts);
+}
+
+static void
+hbBeginForeignModify(ModifyTableState *mt, ResultRelInfo *rinfo,
+					 List *priv, int subplan, int eflags)
+{
+	Relation	rel = rinfo->ri_RelationDesc;
+	Oid			relid = RelationGetRelid(rel);
+	TupleDesc	td = RelationGetDescr(rel);
+	List	   *atts = linitial(priv);
+	HbMod	   *md = palloc0(sizeof(HbMod));
+	Form_pg_attribute ka;
+	ListCell   *lc;
+	Oid			fn;
+	bool		varlena;
+
+	rinfo->ri_FdwState = md;
+	get_opts(relid, &md->o);
+	md->katt = rowkey_att(relid);
+	if (md->katt == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("foreign table \"%s\" needs a rowkey column to be written",
+						RelationGetRelationName(rel))));
+	ka = TupleDescAttr(td, md->katt - 1);
+	md->kraw = (ka->atttypid == BYTEAOID);
+	getTypeOutputInfo(ka->atttypid, &fn, &varlena);
+	fmgr_info(fn, &md->kout);
+
+	/* the columns to write, minus the key, with their HBase names */
+	md->att = palloc(sizeof(AttrNumber) * (list_length(atts) + 1));
+	md->spec = palloc(sizeof(char *) * (list_length(atts) + 1));
+	md->raw = palloc(sizeof(bool) * (list_length(atts) + 1));
+	md->out = palloc(sizeof(FmgrInfo) * (list_length(atts) + 1));
+	md->m = palloc(sizeof(HbMut) * (list_length(atts) + 1));
+	foreach(lc, atts)
+	{
+		AttrNumber	a = lfirst_int(lc);
+		Form_pg_attribute at = TupleDescAttr(td, a - 1);
+		char	   *sp = att_spec(relid, a, NameStr(at->attname), &md->o);
+
+		if (sp == NULL)
+			continue;			/* the row key itself */
+		md->att[md->n] = a;
+		md->spec[md->n] = sp;
+		md->raw[md->n] = (at->atttypid == BYTEAOID);
+		getTypeOutputInfo(at->atttypid, &fn, &varlena);
+		fmgr_info(fn, &md->out[md->n]);
+		md->n++;
+	}
+
+	if (mt->operation != CMD_INSERT)
+	{
+		Plan	   *sub = outerPlanState(mt)->plan;
+
+		md->junk = ExecFindJunkAttributeInTlist(sub->targetlist, "hbase_key");
+		if (!AttributeNumberIsValid(md->junk))
+			elog(ERROR, "hbase_fdw: could not find the hbase_key junk column");
+	}
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+	md->conn = hb_connect(md->o.host, md->o.port, md->o.tmo * 1000);
+}
+
+/* bytes of a value as HBase stores it: raw for bytea, else its text form */
+static void
+val_bytes(bool raw, FmgrInfo *out, Datum d, char **p, int *len)
+{
+	if (raw)
+	{
+		struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
+
+		*p = VARDATA_ANY(v);
+		*len = VARSIZE_ANY_EXHDR(v);
+	}
+	else
+	{
+		*p = OutputFunctionCall(out, d);
+		*len = strlen(*p);
+	}
+}
+
+/* write the columns of slot to row key d */
+static void
+put_row(HbMod *md, Datum d, TupleTableSlot *slot)
+{
+	char	   *k;
+	int			klen,
+				i;
+
+	val_bytes(md->kraw, &md->kout, d, &k, &klen);
+	if (klen == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("HBase row key cannot be empty")));
+	if (md->n == 0)
+		return;					/* nothing to write but the key */
+	slot_getallattrs(slot);
+	for (i = 0; i < md->n; i++)
+	{
+		HbMut	   *m = &md->m[i];
+		int			a = md->att[i] - 1;
+
+		m->col = md->spec[i];
+		m->del = slot->tts_isnull[a];
+		m->val = NULL;
+		m->vlen = 0;
+		if (!m->del)
+			val_bytes(md->raw[i], &md->out[i], slot->tts_values[a], &m->val, &m->vlen);
+	}
+	hb_mutate_row(md->conn, md->o.table, k, klen, md->m, md->n);
+}
+
+static TupleTableSlot *
+hbExecForeignInsert(EState *es, ResultRelInfo *rinfo, TupleTableSlot *slot,
+					TupleTableSlot *plan)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+	bool		isnull;
+	Datum		d = slot_getattr(slot, md->katt, &isnull);
+
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("HBase row key cannot be NULL")));
+	put_row(md, d, slot);
+	return slot;
+}
+
+static TupleTableSlot *
+hbExecForeignUpdate(EState *es, ResultRelInfo *rinfo, TupleTableSlot *slot,
+					TupleTableSlot *plan)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+	bool		isnull;
+	Datum		d = ExecGetJunkAttribute(plan, md->junk, &isnull);
+
+	if (isnull)
+		elog(ERROR, "hbase_fdw: hbase_key is NULL");
+	put_row(md, d, slot);
+	return slot;
+}
+
+static TupleTableSlot *
+hbExecForeignDelete(EState *es, ResultRelInfo *rinfo, TupleTableSlot *slot,
+					TupleTableSlot *plan)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+	bool		isnull;
+	Datum		d = ExecGetJunkAttribute(plan, md->junk, &isnull);
+	char	   *k;
+	int			klen;
+
+	if (isnull)
+		elog(ERROR, "hbase_fdw: hbase_key is NULL");
+	val_bytes(md->kraw, &md->kout, d, &k, &klen);
+	hb_delete_row(md->conn, md->o.table, k, klen);
+	return slot;
+}
+
+static void
+hbEndForeignModify(EState *es, ResultRelInfo *rinfo)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+
+	if (md && md->conn)
+		hb_disconnect(md->conn);
+}
+
 Datum
 hbase_fdw_handler(PG_FUNCTION_ARGS)
 {
@@ -2403,6 +2664,14 @@ hbase_fdw_handler(PG_FUNCTION_ARGS)
 	r->ReScanForeignScan = hbReScanForeignScan;
 	r->EndForeignScan = hbEndForeignScan;
 	r->ExplainForeignScan = hbExplainForeignScan;
+	r->IsForeignRelUpdatable = hbIsForeignRelUpdatable;
+	r->AddForeignUpdateTargets = hbAddForeignUpdateTargets;
+	r->PlanForeignModify = hbPlanForeignModify;
+	r->BeginForeignModify = hbBeginForeignModify;
+	r->ExecForeignInsert = hbExecForeignInsert;
+	r->ExecForeignUpdate = hbExecForeignUpdate;
+	r->ExecForeignDelete = hbExecForeignDelete;
+	r->EndForeignModify = hbEndForeignModify;
 
 	PG_RETURN_POINTER(r);
 }

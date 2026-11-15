@@ -61,6 +61,19 @@ extern void hb_scan_close(HbConn *c, int32 id);
 extern int	hb_get_rows(HbConn *c, const char *table, const HbKey *keys,
 						int nkeys, char **cols, int ncols, HbRow **rows);
 
+/* one cell change for hb_mutate_row (Part D) */
+typedef struct HbMut
+{
+	char	   *col;			/* "family:qualifier" */
+	char	   *val;
+	int			vlen;
+	bool		del;			/* delete the cell instead */
+} HbMut;
+
+extern void hb_mutate_row(HbConn *c, const char *table, const char *key, int klen,
+						  HbMut *m, int n);
+extern void hb_delete_row(HbConn *c, const char *table, const char *key, int klen);
+
 /* for measured costs (Part B) */
 extern void hb_ping(HbConn *c, const char *table);
 extern double hb_last_ms(HbConn *c);	/* time of the last call, ms */
