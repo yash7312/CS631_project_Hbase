@@ -122,6 +122,7 @@ static const Opt opts[] = {
 	{"table", ForeignTableRelationId},
 	{"family", ForeignTableRelationId},
 	{"batch_size", ForeignTableRelationId},
+	{"insert_batch", ForeignTableRelationId},
 	{"rows", ForeignTableRelationId},
 	{"rowkey", AttributeRelationId},
 	{"column", AttributeRelationId},
@@ -136,6 +137,7 @@ typedef struct HbOpts
 	char	   *table;
 	char	   *family;			/* default family for unmapped columns */
 	int			batch;
+	int			ibatch;			/* rows per mutateRows call on INSERT */
 	double		rows;
 } HbOpts;
 
@@ -516,6 +518,7 @@ hbase_fdw_validator(PG_FUNCTION_ARGS)
 		else if (strcmp(d->defname, "timeout") == 0)
 			int_opt(d, 0);
 		else if (strcmp(d->defname, "batch_size") == 0 ||
+				 strcmp(d->defname, "insert_batch") == 0 ||
 				 strcmp(d->defname, "rows") == 0)
 			int_opt(d, 1);
 		else if (strcmp(d->defname, "rowkey") == 0)
@@ -544,6 +547,7 @@ get_opts(Oid relid, HbOpts *o)
 	o->port = DEF_PORT;
 	o->tmo = DEF_TMO;
 	o->batch = DEF_BATCH;
+	o->ibatch = 100;
 	o->rows = DEF_ROWS;
 
 	foreach(lc, l)
@@ -562,6 +566,8 @@ get_opts(Oid relid, HbOpts *o)
 			o->family = defGetString(d);
 		else if (strcmp(d->defname, "batch_size") == 0)
 			o->batch = int_opt(d, 1);
+		else if (strcmp(d->defname, "insert_batch") == 0)
+			o->ibatch = int_opt(d, 1);
 		else if (strcmp(d->defname, "rows") == 0)
 			o->rows = int_opt(d, 1);
 	}
@@ -2416,6 +2422,8 @@ typedef struct HbMod
 	bool		kraw;
 	FmgrInfo	kout;
 	HbMut	   *m;
+	MemoryContext cx;			/* one insert batch */
+	long		nrpc;			/* write calls sent */
 } HbMod;
 
 static int
@@ -2541,6 +2549,8 @@ hbBeginForeignModify(ModifyTableState *mt, ResultRelInfo *rinfo,
 		if (!AttributeNumberIsValid(md->junk))
 			elog(ERROR, "hbase_fdw: could not find the hbase_key junk column");
 	}
+	md->cx = AllocSetContextCreate(mt->ps.state->es_query_cxt, "hbase_fdw insert batch",
+								   ALLOCSET_DEFAULT_SIZES);
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 	md->conn = hb_connect(md->o.host, md->o.port, md->o.tmo * 1000);
@@ -2564,35 +2574,96 @@ val_bytes(bool raw, FmgrInfo *out, Datum d, char **p, int *len)
 	}
 }
 
+/* the key bytes of d (never empty) and the cell changes for slot into m */
+static void
+row_muts(HbMod *md, Datum d, TupleTableSlot *slot, HbKey *key, HbMut *m)
+{
+	int			i;
+
+	val_bytes(md->kraw, &md->kout, d, &key->p, &key->len);
+	if (key->len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("HBase row key cannot be empty")));
+	slot_getallattrs(slot);
+	for (i = 0; i < md->n; i++)
+	{
+		int			a = md->att[i] - 1;
+
+		m[i].col = md->spec[i];
+		m[i].del = slot->tts_isnull[a];
+		m[i].val = NULL;
+		m[i].vlen = 0;
+		if (!m[i].del)
+			val_bytes(md->raw[i], &md->out[i], slot->tts_values[a], &m[i].val, &m[i].vlen);
+	}
+}
+
 /* write the columns of slot to row key d */
 static void
 put_row(HbMod *md, Datum d, TupleTableSlot *slot)
 {
-	char	   *k;
-	int			klen,
-				i;
+	HbKey		k;
 
-	val_bytes(md->kraw, &md->kout, d, &k, &klen);
-	if (klen == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_NOT_NULL_VIOLATION),
-				 errmsg("HBase row key cannot be empty")));
-	if (md->n == 0)
-		return;					/* nothing to write but the key */
-	slot_getallattrs(slot);
-	for (i = 0; i < md->n; i++)
+	row_muts(md, d, slot, &k, md->m);
+	if (md->n > 0)				/* else nothing to write but the key */
 	{
-		HbMut	   *m = &md->m[i];
-		int			a = md->att[i] - 1;
-
-		m->col = md->spec[i];
-		m->del = slot->tts_isnull[a];
-		m->val = NULL;
-		m->vlen = 0;
-		if (!m->del)
-			val_bytes(md->raw[i], &md->out[i], slot->tts_values[a], &m->val, &m->vlen);
+		hb_mutate_row(md->conn, md->o.table, k.p, k.len, md->m, md->n);
+		md->nrpc++;
 	}
-	hb_mutate_row(md->conn, md->o.table, k, klen, md->m, md->n);
+}
+
+/*
+ * Batched INSERT: Postgres hands us up to insert_batch rows at once and we
+ * send them in one mutateRows call, one round trip instead of one per row.
+ * Not with RETURNING or row triggers, where Postgres needs each row back.
+ */
+static int
+hbGetForeignModifyBatchSize(ResultRelInfo *rinfo)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+	HbOpts		o;
+
+	if (rinfo->ri_projectReturning != NULL ||
+		(rinfo->ri_TrigDesc &&
+		 (rinfo->ri_TrigDesc->trig_insert_before_row ||
+		  rinfo->ri_TrigDesc->trig_insert_after_row)))
+		return 1;
+	if (md)
+		return md->o.ibatch;
+	get_opts(RelationGetRelid(rinfo->ri_RelationDesc), &o);
+	return o.ibatch;
+}
+
+static TupleTableSlot **
+hbExecForeignBatchInsert(EState *es, ResultRelInfo *rinfo, TupleTableSlot **slots,
+						 TupleTableSlot **plans, int *n)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+	MemoryContext old = MemoryContextSwitchTo(md->cx);
+	HbKey	   *keys = palloc(sizeof(HbKey) * *n);
+	HbMut	   *m = palloc(sizeof(HbMut) * Max(md->n, 1) * *n);
+	int			i;
+
+	for (i = 0; i < *n; i++)
+	{
+		bool		isnull;
+		Datum		d = slot_getattr(slots[i], md->katt, &isnull);
+
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NOT_NULL_VIOLATION),
+					 errmsg("HBase row key cannot be NULL")));
+		row_muts(md, d, slots[i], &keys[i], m + i * md->n);
+	}
+	if (md->n > 0)
+	{
+		hb_mutate_rows(md->conn, md->o.table, keys, m, md->n, *n);
+		md->nrpc++;
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(md->cx);
+	return slots;
 }
 
 static TupleTableSlot *
@@ -2639,7 +2710,20 @@ hbExecForeignDelete(EState *es, ResultRelInfo *rinfo, TupleTableSlot *slot,
 		elog(ERROR, "hbase_fdw: hbase_key is NULL");
 	val_bytes(md->kraw, &md->kout, d, &k, &klen);
 	hb_delete_row(md->conn, md->o.table, k, klen);
+	md->nrpc++;
 	return slot;
+}
+
+static void
+hbExplainForeignModify(ModifyTableState *mt, ResultRelInfo *rinfo, List *priv,
+					   int subplan, ExplainState *es)
+{
+	HbMod	   *md = rinfo->ri_FdwState;
+
+	if (rinfo->ri_BatchSize > 1)
+		ExplainPropertyInteger("Batch Size", NULL, rinfo->ri_BatchSize, es);
+	if (es->analyze && md)
+		ExplainPropertyInteger("HBase RPCs", NULL, md->nrpc, es);
 }
 
 static void
@@ -2672,6 +2756,9 @@ hbase_fdw_handler(PG_FUNCTION_ARGS)
 	r->ExecForeignUpdate = hbExecForeignUpdate;
 	r->ExecForeignDelete = hbExecForeignDelete;
 	r->EndForeignModify = hbEndForeignModify;
+	r->GetForeignModifyBatchSize = hbGetForeignModifyBatchSize;
+	r->ExplainForeignModify = hbExplainForeignModify;
+	r->ExecForeignBatchInsert = hbExecForeignBatchInsert;
 
 	PG_RETURN_POINTER(r);
 }

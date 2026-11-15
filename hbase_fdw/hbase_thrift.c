@@ -890,6 +890,53 @@ hb_mutate_row(HbConn *c, const char *tab, const char *key, int klen, HbMut *m, i
 	void_reply(c, fn);
 }
 
+/* mutateRows: n rows, ncol cell changes each (m is n * ncol), one round trip */
+void
+hb_mutate_rows(HbConn *c, const char *tab, const HbKey *keys, HbMut *m, int ncol, int n)
+{
+	static const char *fn = "mutateRows";
+	int			i,
+				j;
+
+	wmsg(c, fn);
+	wfld(c, T_STRING, 1);
+	wstr(c, tab, strlen(tab));
+	wfld(c, T_LIST, 2);
+	w8(c, T_STRUCT);
+	w32(c, n);
+	for (i = 0; i < n; i++)
+	{
+		wfld(c, T_STRING, 1);	/* BatchMutation.row */
+		wstr(c, keys[i].p, keys[i].len);
+		wfld(c, T_LIST, 2);		/* BatchMutation.mutations */
+		w8(c, T_STRUCT);
+		w32(c, ncol);
+		for (j = 0; j < ncol; j++)
+		{
+			HbMut	   *x = &m[i * ncol + j];
+
+			wfld(c, T_BOOL, 1);
+			w8(c, x->del ? 1 : 0);
+			wfld(c, T_STRING, 2);
+			wstr(c, x->col, strlen(x->col));
+			if (!x->del)
+			{
+				wfld(c, T_STRING, 3);
+				wstr(c, x->val, x->vlen);
+			}
+			w8(c, T_STOP);
+		}
+		w8(c, T_STOP);			/* end of one BatchMutation */
+	}
+	wfld(c, T_MAP, 3);			/* attributes: empty */
+	w8(c, T_STRING);
+	w8(c, T_STRING);
+	w32(c, 0);
+	w8(c, T_STOP);
+	flush(c);
+	void_reply(c, fn);
+}
+
 /* deleteAllRow: every cell of one row */
 void
 hb_delete_row(HbConn *c, const char *tab, const char *key, int klen)

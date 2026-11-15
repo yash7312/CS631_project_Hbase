@@ -113,6 +113,58 @@ SELECT count(*) FROM emp WHERE id LIKE 'w%';
      0
 (1 row)
 
+-- batched INSERT: insert_batch rows per mutateRows call (default 100);
+-- 7 leaves a partial last batch
+EXPLAIN (COSTS OFF) INSERT INTO emp SELECT 'w' || g, 'n', 'd', g FROM generate_series(1, 3) g;
+                QUERY PLAN                
+------------------------------------------
+ Insert on emp
+   Batch Size: 100
+   ->  Function Scan on generate_series g
+(3 rows)
+
+ALTER FOREIGN TABLE emp OPTIONS (ADD insert_batch '7');
+EXPLAIN (COSTS OFF) INSERT INTO emp SELECT 'w' || g, 'n', 'd', g FROM generate_series(1, 3) g;
+                QUERY PLAN                
+------------------------------------------
+ Insert on emp
+   Batch Size: 7
+   ->  Function Scan on generate_series g
+(3 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  INSERT INTO emp SELECT 'w' || lpad(g::text, 6, '0'), 'n' || g, NULLIF('d' || (g % 7), 'd0'), g
+  FROM generate_series(1, 1000) g;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Insert on emp (actual rows=0.00 loops=1)
+   Batch Size: 7
+   HBase RPCs: 143
+   ->  Function Scan on generate_series g (actual rows=1000.00 loops=1)
+(4 rows)
+
+SELECT count(*), count(dept), sum(salary) FROM emp WHERE id LIKE 'w%';
+ count | count |  sum   
+-------+-------+--------
+  1000 |   858 | 500500
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  DELETE FROM emp WHERE id LIKE 'w%';
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Delete on emp (actual rows=0.00 loops=1)
+   HBase RPCs: 1000
+   ->  Foreign Scan on emp (actual rows=1000.00 loops=1)
+         Filter: (id ~~ 'w%'::text)
+         HBase Table: emp
+         HBase Key Cond: (id ~~ 'w%'::text)
+         HBase Start Row: w
+         HBase Stop Row: x
+         HBase RPCs: 2
+(9 rows)
+
+ALTER FOREIGN TABLE emp OPTIONS (DROP insert_batch);
 -- the original data is untouched
 SELECT count(*) FROM emp;
  count 

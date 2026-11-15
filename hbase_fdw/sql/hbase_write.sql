@@ -56,6 +56,19 @@ SELECT count(*), sum(salary) FROM emp WHERE id LIKE 'w%';
 DELETE FROM emp WHERE id LIKE 'w%';
 SELECT count(*) FROM emp WHERE id LIKE 'w%';
 
+-- batched INSERT: insert_batch rows per mutateRows call (default 100);
+-- 7 leaves a partial last batch
+EXPLAIN (COSTS OFF) INSERT INTO emp SELECT 'w' || g, 'n', 'd', g FROM generate_series(1, 3) g;
+ALTER FOREIGN TABLE emp OPTIONS (ADD insert_batch '7');
+EXPLAIN (COSTS OFF) INSERT INTO emp SELECT 'w' || g, 'n', 'd', g FROM generate_series(1, 3) g;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  INSERT INTO emp SELECT 'w' || lpad(g::text, 6, '0'), 'n' || g, NULLIF('d' || (g % 7), 'd0'), g
+  FROM generate_series(1, 1000) g;
+SELECT count(*), count(dept), sum(salary) FROM emp WHERE id LIKE 'w%';
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  DELETE FROM emp WHERE id LIKE 'w%';
+ALTER FOREIGN TABLE emp OPTIONS (DROP insert_batch);
+
 -- the original data is untouched
 SELECT count(*) FROM emp;
 

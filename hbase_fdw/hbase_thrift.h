@@ -72,6 +72,8 @@ typedef struct HbMut
 
 extern void hb_mutate_row(HbConn *c, const char *table, const char *key, int klen,
 						  HbMut *m, int n);
+extern void hb_mutate_rows(HbConn *c, const char *table, const HbKey *keys,
+						   HbMut *m, int ncol, int n);
 extern void hb_delete_row(HbConn *c, const char *table, const char *key, int klen);
 
 /* for measured costs (Part B) */

@@ -376,6 +376,9 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   - UPDATE cannot change the row key (delete and insert instead); setting a
     column to NULL deletes its cell; a row with no cells left disappears.
   - `DELETE ... RETURNING` returns no column values.
+  - INSERT sends `insert_batch` rows (table option, default 100) per
+    `mutateRows` call, one round trip per batch; not with RETURNING or row
+    triggers. UPDATE and DELETE are one call per row.
 - **Not used for:** `DESC` order (an HBase reversed scan would do it), and
   `NOT IN` / `<>`.
 - **Connections and scanners.**
