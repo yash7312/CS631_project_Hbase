@@ -16,6 +16,9 @@ cd "$(dirname "$0")"
 R=$PWD
 W=$R/work
 mkdir -p "$W"
+export PGHOST=/tmp
+export LD_LIBRARY_PATH="$W/pg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 
 PG_BRANCH=${PG_BRANCH:-REL_18_STABLE}
 HBASE_VER=${HBASE_VER:-3.0.0}
@@ -49,6 +52,7 @@ export PATH="$W/pg/bin:$W/hbase/bin:\$PATH"
 export LD_LIBRARY_PATH="$W/pg/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export PGDATA="$W/pgdata"
 export PGPORT=$PGPORT
+export PGHOST=/tmp
 export HBASE_HOME="$W/hbase"
 EOF
 	if command -v java >/dev/null 2>&1; then
@@ -74,6 +78,7 @@ init_pg() {
 	say "PostgreSQL: initdb (port $PGPORT)"
 	"$(pgbin initdb)" -D "$W/pgdata" -A trust -E UTF8 --locale=C.UTF-8 >/dev/null
 	echo "port = $PGPORT" >>"$W/pgdata/postgresql.conf"
+	echo "unix_socket_directories = '/tmp'" >>"$W/pgdata/postgresql.conf"
 }
 
 start_pg() {
@@ -136,7 +141,11 @@ load_data() {
 	say "load the test data"
 	local i
 	for i in $(seq 12); do   # HBase can take a minute before it accepts tables
-		(cd "$R/hbase_fdw" && python3 test/load_data.py localhost "$TPORT" 10000) && return
+		if [ "$i" -lt 12 ]; then
+			(cd "$R/hbase_fdw" && python3 test/load_data.py localhost "$TPORT" 10000 2>/dev/null) && return
+		else
+			(cd "$R/hbase_fdw" && python3 test/load_data.py localhost "$TPORT" 10000) && return
+		fi
 		sleep 10
 	done
 	die "could not load the test data (is HBase up? see $W/hbase/logs)"
