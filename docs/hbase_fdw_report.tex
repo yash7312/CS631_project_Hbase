@@ -1,118 +1,225 @@
-\documentclass[10pt,a4paper]{article}
+\documentclass[10pt,twocolumn,a4paper]{article}
 \usepackage{fontspec}
-\setmainfont{Latin Modern Roman}
-\setsansfont{Inter}[Scale=0.92]
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
 \setmonofont{Latin Modern Mono}[Scale=0.95]
-\usepackage[a4paper,left=0.8in,right=0.8in,top=0.65in,bottom=0.6in]{geometry}
+\usepackage[a4paper,left=0.7in,right=0.7in,top=0.75in,bottom=0.8in,columnsep=0.28in]{geometry}
 \usepackage{microtype}
 \usepackage{booktabs,tabularx,array}
 \usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{amsmath}
 \usepackage{xcolor}
 \usepackage{titlesec}
+\usepackage{caption}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta}
 \usepackage[hidelinks]{hyperref}
 
-\definecolor{ink}{HTML}{1F2933}
-\definecolor{acc}{HTML}{1D4E89}
-\definecolor{soft}{HTML}{5B6B7C}
-
-\color{ink}
-\pagestyle{empty}
-\setlength{\parindent}{0pt}
-\setlength{\parskip}{3pt}
-
-\titleformat{\section}{\sffamily\large\bfseries\color{acc}}{}{0pt}{}[{\color{acc}\titlerule[0.6pt]}]
-\titlespacing*{\section}{0pt}{7pt}{4pt}
-\titleformat{\subsection}{\sffamily\normalsize\bfseries\color{acc}}{}{0pt}{}
-\titlespacing*{\subsection}{0pt}{4pt}{1pt}
-\setlist{nosep,leftmargin=1.5em,itemsep=2pt}
-
+\titleformat{\section}{\sffamily\large\bfseries}{\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{9pt}{4pt}
+\titleformat{\subsection}{\sffamily\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titlespacing*{\subsection}{0pt}{6pt}{2pt}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+\setlist{nosep,leftmargin=1.3em,itemsep=2pt}
+\setlength{\parskip}{0pt}
 \newcommand{\code}[1]{\texttt{#1}}
-\renewcommand{\arraystretch}{1.25}
+\renewcommand{\arraystretch}{1.15}
+% let figures sit with the text instead of piling up at the end
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\dbltopfraction}{0.9}
+\renewcommand{\textfraction}{0.08}
+\renewcommand{\floatpagefraction}{0.85}
+\renewcommand{\dblfloatpagefraction}{0.85}
+\setcounter{dbltopnumber}{3}
+
+\title{\sffamily\bfseries hbase\_fdw: Network-Aware Querying of HBase from PostgreSQL}
+\author{Yash Singh (23B0934) \quad J Adarsh (23B0960)\\[2pt]
+\small CS631 Course Project, IIT Bombay, November 2026}
+\date{}
 
 \begin{document}
+\maketitle
 
-\begin{center}
-{\sffamily\LARGE\bfseries\color{acc} hbase\_fdw: Querying HBase from PostgreSQL}\\[4pt]
-{\large CS631 Project}\\[2pt]
-\textbf{Yash Singh} (23B0934)\quad\textbf{J Adarsh} (23B0960)
-\end{center}
-\vspace{-4pt}
+\begin{abstract}
+\noindent
+\code{hbase\_fdw} lets PostgreSQL~18 query HBase~3.0 tables in place, through the HBase Thrift gateway, without copying data. It treats HBase's sorted row keys like an index: key lookups, ranges and key lists are pushed into HBase, and the planner knows their cost. On top of that base we make the wrapper aware of the network it runs on. A small proxy makes one laptop behave like two machines; the planner costs each scan from the round-trip time and bandwidth it measures at run time instead of fixed constants; a batched join fetches up to 500 join keys per HBase call instead of one; and \code{INSERT}, \code{UPDATE} and \code{DELETE} write through to HBase, with batched inserts. On real HBase, measured costs pick plans within 1.01$\times$ of the best on average across 81 network settings, against 1.75$\times$ (worst 21.7$\times$) with fixed costs. With the batched join, the planner's choice is within 1.03$\times$ of the fastest of three join methods, and a 1{,}000-row join at 20\,ms round-trip time takes 125\,ms instead of 21\,s of per-row lookups.
+\end{abstract}
 
-\section*{Goal}
-Query data stored in HBase directly from PostgreSQL, without ever loading it into Postgres, and use HBase's own index (its sorted row keys) the way Postgres uses an index. HBase stays underneath as the storage engine; Postgres is a thin SQL layer on top. The idea mirrors \code{file\_fdw}, which reads text files in place, but targets a distributed store with a real index.
+\section{Introduction}
+HBase stores rows sorted by a single row key and serves them over the network. PostgreSQL can reach it through a \emph{foreign data wrapper} (FDW), which presents a remote table as if it were local. A naive wrapper reads the whole table for every query and filters in PostgreSQL, so a one-row lookup costs as much as a full scan.
 
-\section*{The problem}
-The original wrapper treated every query as a full scan. All 10,000 rows crossed the Thrift gateway in batches, every value was converted to a Postgres type, and the \code{WHERE} clause was applied only afterwards, in Postgres. The planner saw one fixed cost for every query, so a one-row lookup and a full scan looked the same, and a join rescanned the table for every outer row (63 round trips for 3 outer rows in the test). Time tracked the table size, not the result size.
+Our wrapper fixes that by using the row key the way PostgreSQL uses a B-tree: a condition on the key becomes an HBase get or range scan, and the planner is told how cheap that is. That base worked well on one machine. It left a deeper problem: its cost constants were tuned on a laptop where a round trip takes well under a millisecond. Once HBase sits across a real network, every call pays latency and every byte pays bandwidth, so the best plan changes and a fixed cost model cannot see it. Results stay correct, so nothing flags the slower plan.
 
-\section*{The approach}
-\code{hbase\_fdw} is a C extension in \code{contrib}: a foreign data wrapper that maps columns to HBase column families and one row-key column, plus a hand-written Thrift client for the HBase gateway. Built in five steps:
-\begin{enumerate}
-\item \textbf{Point lookups.} \code{rowkey = value} becomes a direct HBase seek.
-\item \textbf{Ranges.} \code{BETWEEN}, \code{LIKE 'p\%'} and \code{starts\_with} become a start and stop row, pushed only where Postgres and HBase agree on byte order.
-\item \textbf{Key lists.} \code{IN} and \code{= ANY} use one batched get; a single-key lookup takes one round trip.
-\item \textbf{Cost-based planning.} Row estimates and a cost model (connect 10, 5 per round trip, 0.01 per row) tell the planner that key lookups are cheap. Row-key order is advertised, so \code{ORDER BY} skips the sort.
-\item \textbf{Index joins.} In a join on the row key, each outer row passes its key to HBase, which fetches only the matching row, like a nested-loop index scan. With a 10,000-row table this wins up to about 25 outer rows; beyond that, one full scan with a hash join is cheaper.
-\end{enumerate}
-\textbf{Why Postgres needs no index of its own.} A B-tree narrows the search by descending from the root to the matching leaf. HBase does the same on its side (\code{hbase:meta} to region, block index to data block, bloom filters skip files), so Postgres only turns the condition into a start and stop row or a key set. Nothing is copied and nothing goes stale. Every pushed condition is also rechecked locally, so pushdown can only save work, never change results; output was verified against an identical local table.
-
-\section*{Results}
-Real HBase 3.0 and PostgreSQL 18 on one machine, 10,000-row table, median of 10 to 50 runs. The old point lookups fetched all six columns (about 36 ms); the other queries needed only one or two columns.
-
-\medskip
-{\small
-\begin{tabularx}{\linewidth}{@{}Xrrr@{}}
-\toprule
-\textbf{Query} & \textbf{Before (ms)} & \textbf{Now (ms)} & \textbf{Speed-up}\\
-\midrule
-Point lookup \code{id = 'e004242'} & 36.8 & 1.47 & $\sim$26$\times$\\
-Point lookup, missing key & 35.9 & 1.16 & $\sim$33$\times$\\
-\code{LIKE 'e0042\%'}, 100 rows & 19.8 & 2.1 & $\sim$10$\times$\\
-\code{BETWEEN}, 100 rows & 18.8 & 2.4 & $\sim$8$\times$\\
-\code{ORDER BY id LIMIT 10} & 20.0 & 3.8 & $\sim$5$\times$\\
-\code{id IN} (100 keys) & 20.6 & 7.5 & $\sim$3$\times$\\
-Join, 20 outer rows & 18.2 & 13.1 & 1.4$\times$\\
-Full scan \code{count(*)} & 18.6 & 19.1 & same\\
-Join, 1,000 outer rows & 18.5 & 21.5 & same (hash join)\\
-\bottomrule
-\end{tabularx}}
-
-\smallskip
-The limit is HBase's own: only the row key is indexed, so a filter such as \code{salary > 50000} still reads the whole table.
-
-\clearpage
-\section*{Next implementation steps}
-\subsection*{Cost model and joins}
+\paragraph{Contributions.}
 \begin{itemize}
-\item \textbf{Charge per byte per column}, so wide rows cost more than key-only scans (the 36 ms against 19 ms gap above is not modelled yet).
-\item \textbf{Estimate table size from HBase region sizes}, so the \code{rows} option no longer has to be kept up to date by hand.
-\item \textbf{Batch join lookups}: gather many outer keys (for example 500) into one get, so nested loops stay cheaper well past 25 rows.
-\item \textbf{Cache fetched rows} to cut repeated requests, and add \textbf{parameterized range scans} for conditions such as \code{e.id BETWEEN o.lo AND o.hi}.
+\item \textbf{A latency proxy} that adds a chosen round-trip time and bandwidth cap between PostgreSQL and HBase, so network effects can be tested on one machine (\S\ref{sec:proxy}).
+\item \textbf{Measured cost weights}: the planner costs each HBase scan as time on the current connection, from a short probe and from live replies (\S\ref{sec:costs}).
+\item \textbf{A batched index join} that sends one HBase call per 500 outer rows instead of one per row, for inner and left joins (\S\ref{sec:batch}).
+\item \textbf{Writes}: \code{INSERT}, \code{UPDATE} and \code{DELETE} into HBase, with batched inserts (\S\ref{sec:writes}).
+\item \textbf{An evaluation on real HBase} across round-trip times of 0--20\,ms and bandwidths down to 10\,Mbit/s (\S\ref{sec:eval}).
 \end{itemize}
 
-\subsection*{PostgreSQL features not yet used}
-Both groups fit inside the existing \code{contrib/hbase\_fdw} folder.
+\section{Background}
+\paragraph{HBase.} A table is a sorted map from row key to cells named \code{family:qualifier}. Only the row key is indexed. HBase compares keys as raw bytes; a scan takes an inclusive start row and an exclusive stop row. We use the Thrift1 gateway, which offers gets of many keys at once (\code{getRowsWithColumns}), scanners that return rows in batches, and writes (\code{mutateRow}, \code{mutateRows}, \code{deleteAllRow}).
 
-\medskip
-{\small
-\begin{tabularx}{\linewidth}{@{}>{\ttfamily}lX@{}}
+\paragraph{PostgreSQL FDWs.} The planner asks the wrapper for possible \emph{paths} to read a foreign table, each with a startup and total cost, and keeps the cheapest plan. A \emph{parameterized} path takes a value from the outer side of a join, as an index scan does in a nested loop. Planner hooks such as \code{set\_join\_pathlist\_hook} let an extension add its own join paths, executed by a \emph{CustomScan} node.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=4mm, every node/.style={font=\footnotesize\sffamily},
+  box/.style={draw, rounded corners=2pt, minimum width=0.9\columnwidth, minimum height=6.5mm, align=center},
+  arr/.style={-{Stealth[length=2mm]}}]
+\node[box] (pg) {PostgreSQL 18: planner and executor};
+\node[box, below=of pg, fill=black!6] (fdw) {\code{hbase\_fdw}: key pushdown, measured costs, batched join, writes};
+\node[box, below=of fdw] (th) {hand-written Thrift client (binary protocol over TCP)};
+\node[box, below=of th, dashed] (px) {latency proxy (testing only): RTT/2 each way, bandwidth cap};
+\node[box, below=of px] (hb) {HBase 3.0 Thrift gateway $\rightarrow$ region servers};
+\draw[arr] (pg) -- (fdw); \draw[arr] (fdw) -- (th); \draw[arr] (th) -- (px); \draw[arr] (px) -- (hb);
+\end{tikzpicture}
+\caption{The layers a query passes through. The proxy is inserted only for experiments.}
+\label{fig:arch}
+\end{figure}
+
+\section{The Base Wrapper}
+\label{sec:base}
+Figure~\ref{fig:arch} shows the layers. The wrapper is written in C with its own Thrift client and maps each column either to the row key or to an HBase cell.
+
+\paragraph{Key pushdown.} Each \code{WHERE} condition on the row key becomes a byte range. Equality \code{k = v} becomes $[v, v\backslash0)$, because HBase's stop row is exclusive; \code{LIKE 'p\%'} becomes $[p, p{+}1)$; $<$, $\le$, $>$ and $\ge$ narrow the range, and several ranges intersect. \code{IN} lists become a sorted, de-duplicated key list fetched in batched gets. Ranges are pushed only under the C collation, \code{bytea} or \code{text\_pattern\_ops}, where PostgreSQL orders strings the way HBase orders bytes. Every pushed condition is also checked again locally, so a pushdown mistake can never return a wrong row.
+
+\paragraph{Planner integration.} The wrapper estimates how many rows each path returns, costs it as \emph{connect} + \emph{calls} $\times$ 15 + \emph{rows} $\times$ 0.005 (the fixed constants), and declares that rows come out in key order, so \code{ORDER BY key} needs no sort. For a join on the key it offers a parameterized path: each outer row's key becomes one HBase get.
+
+Table~\ref{tab:base} shows the effect against the original full-scan wrapper. Lookups drop from tens of milliseconds to about one; full scans are unchanged, as expected.
+
+\begin{table}[t]
+\centering\small
+\caption{Base wrapper on real HBase, 10{,}000 rows, one machine (median of 10--50 runs).}
+\label{tab:base}
+\begin{tabularx}{\columnwidth}{@{}Xrr@{}}
 \toprule
-\multicolumn{2}{@{}l}{\textbf{FDW callbacks}}\\
+\textbf{Query} & \textbf{Full scan (ms)} & \textbf{Pushdown (ms)}\\
 \midrule
-AnalyzeForeignTable & \code{ANALYZE} samples HBase rows for real statistics, replacing the manual \code{rows} option\\
-GetForeignUpperPaths & push aggregates, \code{ORDER BY} and \code{LIMIT} into HBase, or stop scans early\\
-GetForeignJoinPaths & push a join between two HBase tables to the server side\\
-ImportForeignSchema & \code{IMPORT FOREIGN SCHEMA} creates foreign tables from HBase's table and column-family list\\
-\midrule
-\multicolumn{2}{@{}l}{\textbf{Planner hooks} (easy to add, but must leave plans for ordinary tables untouched)}\\
-\midrule
-set\_rel\_pathlist\_hook & add or remove access paths for any table, including HBase ones\\
-set\_join\_pathlist\_hook & add join paths, such as a batched-lookup join\\
-create\_upper\_paths\_hook & add paths for aggregates, sorts and \code{LIMIT} above the scan\\
-get\_relation\_info\_hook & change what the planner believes about a table (size, indexes)\\
+Point lookup & 36.8 & 1.47\\
+Missing key & 35.9 & 1.16\\
+\code{LIKE 'prefix\%'}, 100 rows & 19.8 & 2.1\\
+\code{BETWEEN}, 100 rows & 18.8 & 2.4\\
+\code{ORDER BY key LIMIT 10} & 20.0 & 3.8\\
+\code{IN}, 100 keys & 20.6 & 7.5\\
+Join, 20 outer rows & 18.2 & 13.1\\
+Full scan & 18.6 & 19.1\\
 \bottomrule
-\end{tabularx}}
+\end{tabularx}
+\end{table}
 
-\medskip
-\textbf{Guiding principle.} Postgres stays a thin wrapper and never imports data: filtering and index use happen in HBase, so only a small result crosses the gateway. Copying large HBase tables into Postgres would duplicate storage and go stale.
+\section{A Latency Proxy}
+\label{sec:proxy}
+Loopback has almost no latency, so tests on one machine hide exactly the effects we care about. We place a small TCP proxy between PostgreSQL and the Thrift gateway; pointing the foreign server at the proxy's port is the only change.
+
+For each connection, one thread per direction reads chunks of bytes and stamps each with a release time, arrival + RTT/2, never earlier than the previous chunk so bytes stay in order. A second thread waits for each release time and forwards the chunk; an optional bandwidth cap adds the time the bytes take on the link. A request and its reply each wait RTT/2, so every call pays one RTT. The proxy also waits one RTT before forwarding a new connection, because loopback otherwise makes the TCP handshake free. Settings change at run time through a control port.
+
+\paragraph{Accuracy.} On real HBase, a point lookup is one connect plus one get, so it should gain two RTTs. Through the proxy it gains 10.6, 21.3 and 40.5\,ms at RTTs of 5, 10 and 20\,ms, within 6\% of 10, 20 and 40\,ms.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.88\textwidth]{../graphs/fig1_regret.png}
+\caption{Mean plan regret, fixed against measured costs, 9 outer sizes per point. Fixed costs are worst on a slow link with no added latency (6.5$\times$ at 10\,Mbit/s, RTT~0); measured costs stay near 1.0 everywhere.}
+\label{fig:regret}
+\end{figure*}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.88\textwidth]{../graphs/fig3_breakeven.png}
+\caption{Outer rows at which a hash join starts to beat per-row gets. Fixed costs always switch at 30; measured costs track the true break-even, which ranges from 15 to over 300 rows.}
+\label{fig:breakeven}
+\end{figure*}
+\section{Measured Cost Weights}
+\label{sec:costs}
+With adaptive costs on, the planner costs a path as the time it should take on this connection, converted to cost units by a constant \code{cost\_per\_ms}:
+\begin{align*}
+t = {} & t_{\text{conn}} + n_{\text{call}}\, t_{\text{call}} + (n_{\text{key}} - n_{\text{call}})\, t_{\text{key}}\\
+& + \text{rows} \cdot \text{bpr} / \text{bw} + \text{rows} \cdot c_{\text{row}}
+\end{align*}
+where $n_{\text{call}}$ is the number of HBase calls (batches, plus open and close for a scan) and bpr the bytes per row.
+
+\paragraph{Measuring.} The first plan in a session that touches a server opens one connection and measures:
+\begin{itemize}
+\item $t_{\text{call}}$: the best of two one-key gets. A bare ping is cheaper than a real get, so it would make gets look too cheap.
+\item bandwidth: bytes $\div$ (time $-\,t_{\text{call}}$) of the \emph{second} 1{,}000-row scan batch; the first includes HBase warming up its scanner.
+\item bytes per cell: from that batch. A path's bytes per row is bytes per cell times the cells it actually fetches, so a query reading one column is not charged for the whole row.
+\item $t_{\text{key}}$: a 100-key get of a column no row has. HBase still looks up every key, but the reply is empty, so the time is per-key work rather than a TCP delayed-ACK stall on a large reply.
+\end{itemize}
+The probe costs about a dozen round trips, once per session. Later scan replies keep adding to the bandwidth and bytes-per-cell totals. Two settings, \code{hbase\_fdw.rtt\_ms} and \code{bw\_mbps}, override the measured values for experiments, and \code{adaptive\_costs = off} restores the fixed constants.
+
+\paragraph{Why it matters.} A nested loop of gets and a hash join over a full scan both pay per round trip, so changing the RTT alone moves their break-even only a little. Bandwidth is different: on a slow link the full scan's 2.2\,MB dominate while the gets stay small, so per-row gets win up to hundreds of rows. Fixed costs cannot see this and always switch at the same point (\S\ref{sec:eval}).
+
+\section{Batched Index Join}
+\label{sec:batch}
+A parameterized path makes one HBase call per outer row. Following the idea of batched bindings~\cite{guravannavar08}, we add a join that collects K outer rows (default 500), fetches all their keys in one \code{getRowsWithColumns} call, and then emits the outer rows in their original order joined with their HBase row. Round trips drop from $n$ to $\lceil n/K \rceil$.
+
+\paragraph{Planning.} A \code{set\_join\_pathlist\_hook} looks for a join whose inner side is an \code{hbase\_fdw} table and whose clause is \code{rowkey = outer column}. It offers a CustomScan path costed with the same measured weights, so the planner picks it only when it is cheaper. Two details mattered. For a join, PostgreSQL passes the plan step the join relation's own (empty) restriction list, so the join clauses must travel inside the path. And the inner table is kept by OID, because range-table indexes are renumbered when subqueries are flattened.
+
+\paragraph{Execution.} The node pulls K outer rows, turns each key into HBase bytes (NULL and empty keys never match), sorts and de-duplicates them, and fetches them in one call per \code{batch\_size} keys. It then walks the K outer rows in order; a key matches at most one HBase row, so rows fetched are at most the outer rows.
+
+\paragraph{Left joins.} For a \code{LEFT JOIN}, the \code{ON} clauses and the HBase table's own conditions decide whether an outer row has a match; an unmatched row comes back once with NULLs, and \code{WHERE} clauses filter afterwards. Above a left join, PostgreSQL~16+ marks the inner columns as nullable, while inside the \code{ON} clause they are not. Its plan fix-up step matches a column only by table and attribute and checks the first entry it finds, so listing a column twice does not work. We therefore point the \code{ON} clauses at the node's column list by hand and keep them out of that step.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.74\textwidth]{../graphs/fig2_join_time.png}
+\caption{Join time against outer rows for each method, forced. The batched join is fastest from 10 outer rows up; per-row gets grow linearly with $n$.}
+\label{fig:join}
+\end{figure*}
+\section{Writes}
+\label{sec:writes}
+\code{INSERT} turns each row into one \code{mutateRow} call: a value becomes a put, and NULL deletes the cell. \code{UPDATE} finds the row through a hidden row-identity column carrying the key, and writes only the \code{SET} columns. \code{DELETE} calls \code{deleteAllRow}. PostgreSQL's batch-insert interface lets \code{INSERT} send 100 rows per \code{mutateRows} call.
+
+HBase writes behave differently from PostgreSQL's. A put on an existing key overwrites it, so \code{INSERT} is an upsert; each call commits at once, so \code{ROLLBACK} does not undo it; and the row key cannot be updated in place.
+
+\section{Evaluation}
+\label{sec:eval}
+\paragraph{Setup.} PostgreSQL~18 and standalone HBase~3.0.0 on one Ubuntu laptop, a 10{,}000-row table, all traffic through the proxy. The join query reads the first $n$ rows of a local table and joins them to HBase on the row key. For each setting we time every join method forced (median of 3 runs after a warm-up; runs over 2\,s are timed once) and ask the planner which plan it would pick. \emph{Plan regret} is the time of the chosen plan divided by the time of the fastest one; 1.0 means the planner chose right. Three regression suites (reads, batched joins, writes) pass on both real HBase and an in-memory mock.
+
+
+\paragraph{Plan quality.} Across 81 settings (RTT 0, 5 and 20\,ms; bandwidth unlimited, 100 and 10\,Mbit/s; 9 outer sizes from 1 to 300), measured costs give a mean regret of 1.01 (worst 1.55); fixed costs give 1.75 (worst 21.7). Figure~\ref{fig:regret} shows where the difference comes from: at 10\,Mbit/s fixed costs average 2.96, because they choose a hash join over a 2.2\,MB scan when a few gets would do (30 outer rows: 573\,ms against 26\,ms).
+
+
+\paragraph{Break-even.} Figure~\ref{fig:breakeven} shows why. The true break-even between per-row gets and a hash join moves from 15 rows (fast link, high RTT) to over 300 (10\,Mbit/s). Fixed costs switch at 30 rows everywhere; measured costs follow the true point closely; the largest gaps are at 100\,Mbit/s with RTT~0 (100 against 300 rows) and at 10\,Mbit/s with 20\,ms (100 against 40).
+
+
+\paragraph{Join methods.} Figure~\ref{fig:join} compares the three methods. At 20\,ms, 100 outer rows take 2.1\,s as per-row gets, 304\,ms as a hash join and 53\,ms batched; at 1{,}000 rows, 21.4\,s, 306\,ms and 125\,ms. With the batched join available, the planner's mean regret over 54 settings is 1.03, against 5.01 for measured costs without it and 7.67 for fixed costs; it chose the batched join in 45 of the 54 and per-row gets for single-row joins. Its worst case is 1.87, on loopback with 1{,}000 rows, where the batched join (64\,ms) lost to a hash join (34\,ms): there the per-key cost estimate is at the edge.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../graphs/fig4_writes.png}
+\caption{Time to write 1{,}000 rows. Batching inserts cuts 7.0\,s to 0.12\,s at 5\,ms RTT; updates and deletes still make one call per row.}
+\label{fig:writes}
+\end{figure}
+
+\paragraph{Writes.} Figure~\ref{fig:writes}: one call per row costs about 6.3--7.0\,s per 1{,}000 rows at 5\,ms. Batched inserts take 118\,ms there (60$\times$ faster) and 50\,ms on loopback (6$\times$).
+
+\section{Related Work}
+Vonng's \code{hbase\_fdw}~\cite{vonng} wraps HBase in Python through Multicorn and HappyBase and supports writes, but does not integrate with the planner's costs, key order or joins; HadoopFDW from BigSQL and the CData JDBC wrapper are similar bridges. Apache Phoenix~\cite{phoenix} goes the other way and builds a SQL engine inside HBase. Among PostgreSQL wrappers, \code{postgres\_fdw}~\cite{pgfdw} can ask the remote server for estimates and batches inserts, but its startup and per-tuple costs are fixed options rather than measured from the network.
+
+Costing communication is old: the R* optimizer modelled message and transfer costs in distributed queries~\cite{mackert86}, and Garlic let wrappers supply costs for diverse sources~\cite{haas97}. Our weights are measured from the live connection rather than configured. The batched join applies the batched-bindings idea of Guravannavar and Sudarshan~\cite{guravannavar08} at the wrapper boundary.
+
+\section{Limitations and Future Work}
+\begin{itemize}
+\item Weights live per session and are measured once; a link that changes mid-session is not noticed. Prepared statements keep the weights they were planned with.
+\item Only the row key is indexed, so other filters still scan; HBase server-side filters could push down equality on other columns.
+\item The batched join handles a plain-column key, not expressions; a hash join can still win for very large outer sides on loopback.
+\item No rollback for writes, and no batching for \code{UPDATE} or \code{DELETE}.
+\item The proxy approximates a network; a run across two real machines is still to be added.
+\end{itemize}
+
+\section{Conclusion}
+A foreign data wrapper that only knows fixed costs plans for the machine it was tuned on. By measuring the connection it actually uses, \code{hbase\_fdw} keeps choosing the right plan from loopback to a 10\,Mbit/s, 20\,ms link, and by batching join lookups and inserts it turns per-row round trips into per-batch ones. Both changes stay inside PostgreSQL's planner and executor interfaces, and HBase remains the only copy of the data.
+
+\begin{thebibliography}{9}\small
+\setlength{\itemsep}{0pt}\setlength{\parsep}{0pt}
+\bibitem{guravannavar08} R.~Guravannavar and S.~Sudarshan. Rewriting procedures for batched bindings. \emph{PVLDB}, 1(1), 2008.
+\bibitem{haas97} L.~M.~Haas, D.~Kossmann, E.~L.~Wimmers, and J.~Yang. Optimizing queries across diverse data sources. In \emph{VLDB}, 1997.
+\bibitem{mackert86} L.~F.~Mackert and G.~M.~Lohman. R* optimizer validation and performance evaluation for distributed queries. In \emph{VLDB}, 1986.
+\bibitem{phoenix} Apache Phoenix: OLTP and operational analytics for Apache Hadoop. \url{https://phoenix.apache.org}.
+\bibitem{pgfdw} PostgreSQL Global Development Group. postgres\_fdw. PostgreSQL 18 documentation.
+\bibitem{vonng} R.~Feng (Vonng). hbase\_fdw: HBase foreign data wrapper for PostgreSQL. \url{https://github.com/Vonng/hbase_fdw}.
+\end{thebibliography}
 
 \end{document}
