@@ -367,8 +367,9 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   - Join size estimates on the key are poor (Postgres assumes 200 distinct
     keys), though the path choice is still right.
 - **Joins.** A parameterized lookup is 1 RPC per outer row. For an inner
-  join on the row key, the batched join (`hbase_fdw.batch_join`) fetches K
-  outer keys per call instead; LEFT JOIN is not batched yet.
+  or LEFT join on the row key, the batched join (`hbase_fdw.batch_join`)
+  fetches K outer keys per call instead (v1: the outer key must be a plain
+  column, no subqueries in the join clauses).
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
   - No rollback: each row is written to HBase at once, so `ROLLBACK` does

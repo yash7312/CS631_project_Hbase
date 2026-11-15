@@ -70,10 +70,39 @@ SET hbase_fdw.join_batch = 500; SELECT bj_diff();
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
   SELECT count(e.name) FROM bo1k o JOIN emp e ON e.id = o.k;
 
+-- LEFT JOIN: an outer row with no match comes back once, with NULLs
+SET hbase_fdw.join_batch = 3;
+EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo LEFT JOIN emp e ON e.id = bo.k;
+SELECT bo.tag, e.id, e.name FROM bo LEFT JOIN emp e ON e.id = bo.k ORDER BY bo.tag;
+-- ON on an HBase column decides the match; WHERE filters afterwards
+EXPLAIN (COSTS OFF) SELECT bo.tag, e.id, e.salary FROM bo LEFT JOIN emp e
+  ON e.id = bo.k AND e.salary > 150000;
+SELECT bo.tag, e.id, e.salary FROM bo LEFT JOIN emp e
+  ON e.id = bo.k AND e.salary > 150000 ORDER BY bo.tag;
+SELECT bo.tag, e.id FROM bo LEFT JOIN emp e ON e.id = bo.k
+  WHERE e.salary > 150000 OR bo.tag > 4 ORDER BY bo.tag;
+-- 1000 outer rows, about half of them with no HBase row
+CREATE TABLE bo2 AS SELECT g AS oid,
+  'e' || lpad((g * 37 % 20000 + 1)::text, 6, '0') AS k FROM generate_series(1, 1000) g;
+ANALYZE bo2;
+-- force the batched join (K = 500) so these check it, not a hash join
+SET hbase_fdw.join_batch = 500;
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_nestloop = off;
+SELECT count(*) AS rows, count(e.id) AS matched FROM bo2 o LEFT JOIN emp e ON e.id = o.k;
+SELECT count(*) AS diff FROM (
+  (SELECT o.oid, e.name FROM bo2 o LEFT JOIN emp e ON e.id = o.k
+   EXCEPT ALL SELECT o.oid, l.name FROM bo2 o LEFT JOIN emp_local l ON l.id = o.k)
+  UNION ALL
+  (SELECT o.oid, l.name FROM bo2 o LEFT JOIN emp_local l ON l.id = o.k
+   EXCEPT ALL SELECT o.oid, e.name FROM bo2 o LEFT JOIN emp e ON e.id = o.k)) d;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(e.name) FROM bo2 o LEFT JOIN emp e ON e.id = o.k;
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_nestloop;
+
 -- switched off: back to the parameterized nested loop or a hash join
 SET hbase_fdw.batch_join = off;
 EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo JOIN emp e ON e.id = bo.k;
 
-DROP TABLE bo, bo1k, emp_local;
+DROP TABLE bo, bo1k, bo2, emp_local;
 DROP FUNCTION bj_diff();
 DROP EXTENSION hbase_fdw CASCADE;

@@ -1895,6 +1895,8 @@ typedef struct BjState
 	int			kpos;			/* outer position of the key column */
 	int			K;
 	KeyCond		kk;				/* how to turn an outer key into bytes */
+	JoinType	jt;				/* JOIN_INNER or JOIN_LEFT */
+	ExprState  *jq;				/* LEFT: the ON clauses, which decide a match */
 
 	TupleTableSlot **outs;		/* buffered outer rows */
 	HbKey	   *okeys;			/* their keys, p = NULL for NULL / empty */
@@ -1949,7 +1951,7 @@ bj_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 
 	if (prev_join_hook)
 		prev_join_hook(root, joinrel, outerrel, innerrel, jt, extra);
-	if (!batch_join || jt != JOIN_INNER)
+	if (!batch_join || (jt != JOIN_INNER && jt != JOIN_LEFT))
 		return;
 	if (innerrel->reloptkind != RELOPT_BASEREL || innerrel->fdwroutine == NULL ||
 		innerrel->fdwroutine->GetForeignPaths != hbGetForeignPaths)
@@ -1970,13 +1972,22 @@ bj_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 			return;
 	}
 
+	/* v1: plain clauses only, no subqueries */
+	foreach(lc, extra->restrictlist)
+		if (contain_subplans((Node *) ((RestrictInfo *) lfirst(lc))->clause))
+			return;
+
 	/* find  inner.rowkey = outer.column  among the join clauses */
 	foreach(lc, extra->restrictlist)
 	{
+		RestrictInfo *rinfo = lfirst(lc);
 		Node	   *val;
 		int			kop;
 
-		if (key_cond(lfirst(lc), innerrel->relid, ri->katt, &val, &kop) &&
+		/* for a LEFT join the key must come from ON, not from WHERE */
+		if (jt == JOIN_LEFT && RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
+			continue;
+		if (key_cond(rinfo, innerrel->relid, ri->katt, &val, &kop) &&
 			kop == BTEqualStrategyNumber)
 		{
 			while (IsA(val, RelabelType))
@@ -2005,11 +2016,47 @@ bj_hook(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		op->rows * cpu_operator_cost + joinrel->rows * cpu_tuple_cost;
 	cp->path.pathkeys = op->pathkeys;	/* outer order survives */
 	cp->custom_paths = list_make1(op);
-	cp->custom_private = list_make4(ov, extra->restrictlist,
+	cp->custom_private = list_make5(ov, extra->restrictlist,
 									innerrel->baserestrictinfo,
-									makeInteger(innerrel->relid));
+									makeInteger(innerrel->relid),
+									makeInteger(jt));
 	cp->methods = &bj_path_methods;
 	add_path(joinrel, (Path *) cp);
+}
+
+/*
+ * Point the Vars of an ON clause at the flat list (INDEX_VAR, by table and
+ * column, ignoring nulling bits), adding columns it lacks.
+ */
+static Node *
+jq_fix(Node *n, List **flat)
+{
+	if (n == NULL)
+		return NULL;
+	if (IsA(n, Var))
+	{
+		Var		   *v = (Var *) n,
+				   *nv;
+		ListCell   *lc;
+		int			i = 1;
+
+		foreach(lc, *flat)
+		{
+			Var		   *f = (Var *) ((TargetEntry *) lfirst(lc))->expr;
+
+			if (IsA(f, Var) && f->varno == v->varno && f->varattno == v->varattno)
+				break;
+			i++;
+		}
+		if (i > list_length(*flat))
+			*flat = lappend(*flat, makeTargetEntry((Expr *) copyObject(v), i, NULL, false));
+		nv = copyObject(v);
+		nv->varno = INDEX_VAR;
+		nv->varattno = i;
+		nv->varnullingrels = NULL;
+		return (Node *) nv;
+	}
+	return expression_tree_mutator(n, jq_fix, flat);
 }
 
 static Plan *
@@ -2019,7 +2066,9 @@ bj_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *cp, List *tlist,
 	CustomScan *cs = makeNode(CustomScan);
 	Var		   *ov = linitial(cp->custom_private);
 	int			inner = intVal(lfourth(cp->custom_private));
-	List	   *quals,
+	JoinType	jt = intVal(list_nth(cp->custom_private, 4));
+	List	   *quals = NIL,
+			   *jq = NIL,
 			   *flat,
 			   *opos = NIL,
 			   *iatt = NIL;
@@ -2028,13 +2077,38 @@ bj_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *cp, List *tlist,
 	ListCell   *lc,
 			   *lc2;
 
-	/* join clauses are not in 'clauses' for a join: they came with the path */
-	quals = list_concat(extract_actual_clauses(lsecond(cp->custom_private), false),
-						extract_actual_clauses(lthird(cp->custom_private), false));
+	/*
+	 * Join clauses are not in 'clauses' for a join: they came with the path.
+	 * INNER: every clause just filters the joined rows (plan.qual).
+	 * LEFT: ON clauses and the HBase table's own quals decide whether an
+	 * outer row has a match (custom_exprs, checked by us); WHERE clauses
+	 * filter afterwards, NULL-extended rows too (plan.qual).
+	 */
+	foreach(lc, lsecond(cp->custom_private))
+	{
+		RestrictInfo *r = lfirst(lc);
 
-	/* every Var the output and the quals use, in one flat list */
+		if (jt == JOIN_LEFT && !RINFO_IS_PUSHED_DOWN(r, rel->relids))
+			jq = lappend(jq, r->clause);
+		else
+			quals = lappend(quals, r->clause);
+	}
+	if (jt == JOIN_LEFT)
+		jq = list_concat(jq, extract_actual_clauses(lthird(cp->custom_private), false));
+	else
+		quals = list_concat(quals, extract_actual_clauses(lthird(cp->custom_private), false));
+
+	/*
+	 * Every Var the output and the filters use, in one flat list. The ON
+	 * clauses are pointed at it by hand (jq_fix): above a LEFT join, HBase
+	 * columns carry the join's nulling bit and ON clauses use them without
+	 * it, and setrefs only checks the first entry for a column, so one
+	 * entry per column and no setrefs for the ON clauses.
+	 */
 	flat = add_to_flat_tlist(NIL, pull_var_clause((Node *) tlist, 0));
 	flat = add_to_flat_tlist(flat, pull_var_clause((Node *) quals, 0));
+	jq = (List *) jq_fix((Node *) jq, &flat);
+	fix_opfuncids((Node *) jq);
 
 	foreach(lc, flat)
 	{
@@ -2075,13 +2149,15 @@ bj_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *cp, List *tlist,
 
 	cs->scan.plan.targetlist = tlist;
 	cs->scan.plan.qual = quals;	/* ExecScan checks these on each joined row */
+
 	cs->scan.scanrelid = 0;		/* a join: no single relation */
 	cs->custom_scan_tlist = flat;
 	cs->custom_plans = plans;
 	/* the table's OID, not its range table index: setrefs renumbers those */
-	cs->custom_private = list_make3(opos, iatt,
+	cs->custom_private = list_make5(opos, iatt,
 									list_make3_oid(planner_rt_fetch(inner, root)->relid,
-												   join_batch, kpos));
+												   join_batch, kpos),
+									makeInteger(jt), jq);
 	cs->methods = &bj_scan_methods;
 	return (Plan *) cs;
 }
@@ -2115,6 +2191,8 @@ bj_begin(CustomScanState *node, EState *estate, int eflags)
 	node->custom_ps = list_make1(ExecInitNode(linitial(cs->custom_plans), estate, eflags));
 	s->K = lsecond_oid(ints);
 	s->kpos = lthird_oid(ints);
+	s->jt = intVal(lfourth(cs->custom_private));
+	s->jq = ExecInitQual(list_nth(cs->custom_private, 4), (PlanState *) node);
 	s->nflat = list_length(opos);
 	s->opos = palloc(sizeof(int) * Max(s->nflat, 1));
 	s->iatt = palloc(sizeof(int) * Max(s->nflat, 1));
@@ -2233,7 +2311,7 @@ bj_find(BjState *s, HbKey *k)
 	return NULL;
 }
 
-/* fill the scan slot from outer row o and HBase row r */
+/* fill the scan slot from outer row o and HBase row r (NULL: all NULLs) */
 static void
 bj_row(BjState *s, TupleTableSlot *o, HbRow *r)
 {
@@ -2243,7 +2321,10 @@ bj_row(BjState *s, TupleTableSlot *o, HbRow *r)
 
 	ExecClearTuple(out);
 	ExecClearTuple(in);
-	fill(&s->hb, in, r);		/* fill() only writes the value arrays */
+	if (r)
+		fill(&s->hb, in, r);	/* fill() only writes the value arrays */
+	else
+		memset(in->tts_isnull, true, sizeof(bool) * in->tts_tupleDescriptor->natts);
 	ExecStoreVirtualTuple(in);
 	slot_getallattrs(o);
 	for (i = 0; i < s->nflat; i++)
@@ -2271,21 +2352,29 @@ bj_next(ScanState *ss)
 	{
 		while (s->k < s->nout)	/* the buffered outer rows, in order */
 		{
+			ExprContext *ec = ss->ps.ps_ExprContext;
 			TupleTableSlot *o = s->outs[s->k];
 			HbRow	   *r = bj_find(s, &s->okeys[s->k]);
+			MemoryContext old;
+			bool		hit = false;
 
 			s->k++;
-			if (r == NULL)
-				continue;		/* inner join: no match, no row */
 			/* converted values live until ExecScan's next per-tuple reset */
+			old = MemoryContextSwitchTo(ec->ecxt_per_tuple_memory);
+			if (r)
 			{
-				MemoryContext old =
-					MemoryContextSwitchTo(ss->ps.ps_ExprContext->ecxt_per_tuple_memory);
-
 				bj_row(s, o, r);
-				MemoryContextSwitchTo(old);
+				ec->ecxt_scantuple = ss->ss_ScanTupleSlot;
+				hit = ExecQual(s->jq, ec);	/* no ON clauses: true */
 			}
-			return ss->ss_ScanTupleSlot;
+			if (!hit && s->jt == JOIN_LEFT)
+			{
+				bj_row(s, o, NULL);	/* no match: the outer row with NULLs */
+				hit = true;
+			}
+			MemoryContextSwitchTo(old);
+			if (hit)
+				return ss->ss_ScanTupleSlot;
 		}
 		if (s->done)
 			return ExecClearTuple(ss->ss_ScanTupleSlot);
@@ -2334,6 +2423,16 @@ bj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	BjState    *s = (BjState *) node;
 
+	ExplainPropertyText("Join Type", s->jt == JOIN_LEFT ? "Left" : "Inner", es);
+	if (list_nth(((CustomScan *) node->ss.ps.plan)->custom_private, 4))
+	{
+		List	   *jq = list_nth(((CustomScan *) node->ss.ps.plan)->custom_private, 4);
+		List	   *cx = set_deparse_context_plan(es->deparse_cxt, node->ss.ps.plan, ancestors);
+
+		ExplainPropertyText("Join Cond",
+							deparse_expression((Node *) make_ands_explicit(jq), cx,
+											   es->verbose, false), es);
+	}
 	ExplainPropertyText("HBase Table", s->hb.o.table, es);
 	ExplainPropertyInteger("Batch Size", NULL, s->K, es);
 	if (es->analyze)

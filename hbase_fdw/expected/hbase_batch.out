@@ -27,10 +27,11 @@ EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo JOIN emp e ON e.id = bo.k;
 ----------------------------------
  Custom Scan (HBase Batched Join)
    Filter: (id = k)
+   Join Type: Inner
    HBase Table: emp
    Batch Size: 500
    ->  Seq Scan on bo
-(5 rows)
+(6 rows)
 
 -- K = 2 crosses batches; rows come back like the local join's
 SET hbase_fdw.join_batch = 2;
@@ -63,12 +64,13 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 -------------------------------------------------------------
  Custom Scan (HBase Batched Join) (actual rows=5.00 loops=1)
    Filter: (id = k)
+   Join Type: Inner
    HBase Table: emp
    Batch Size: 2
    Batches: 4
    HBase RPCs: 3
    ->  Seq Scan on bo (actual rows=8.00 loops=1)
-(7 rows)
+(8 rows)
 
 -- a join qual on a non-key column is checked on each joined row
 SELECT bo.tag, e.salary > 150000 AS big FROM bo JOIN emp e
@@ -91,10 +93,11 @@ EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo JOIN emp e ON e.id = bo.k
    Sort Key: bo.tag
    ->  Custom Scan (HBase Batched Join)
          Filter: (id = k)
+         Join Type: Inner
          HBase Table: emp
          Batch Size: 2
          ->  Seq Scan on bo
-(7 rows)
+(8 rows)
 
 -- rescans: the join inside a correlated subquery
 SELECT g, (SELECT count(*) FROM bo JOIN emp e ON e.id = bo.k WHERE bo.tag <= g) AS n
@@ -147,13 +150,117 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
  Aggregate (actual rows=1.00 loops=1)
    ->  Custom Scan (HBase Batched Join) (actual rows=1000.00 loops=1)
          Filter: (id = k)
+         Join Type: Inner
          HBase Table: emp
          Batch Size: 500
          Batches: 2
          HBase RPCs: 2
          ->  Seq Scan on bo1k o (actual rows=1000.00 loops=1)
+(9 rows)
+
+-- LEFT JOIN: an outer row with no match comes back once, with NULLs
+SET hbase_fdw.join_batch = 3;
+EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo LEFT JOIN emp e ON e.id = bo.k;
+            QUERY PLAN            
+----------------------------------
+ Custom Scan (HBase Batched Join)
+   Join Type: Left
+   Join Cond: (id = k)
+   HBase Table: emp
+   Batch Size: 3
+   ->  Seq Scan on bo
+(6 rows)
+
+SELECT bo.tag, e.id, e.name FROM bo LEFT JOIN emp e ON e.id = bo.k ORDER BY bo.tag;
+ tag |   id    |   name   
+-----+---------+----------
+   1 | e000001 | zoya_1
+   2 | e000001 | zoya_1
+   3 |         | 
+   4 |         | 
+   5 |         | 
+   6 | e000010 | meera_10
+   7 | e000003 | ravi_3
+   8 | e000010 | meera_10
 (8 rows)
 
+-- ON on an HBase column decides the match; WHERE filters afterwards
+EXPLAIN (COSTS OFF) SELECT bo.tag, e.id, e.salary FROM bo LEFT JOIN emp e
+  ON e.id = bo.k AND e.salary > 150000;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Custom Scan (HBase Batched Join)
+   Join Type: Left
+   Join Cond: ((id = k) AND (salary > 150000))
+   HBase Table: emp
+   Batch Size: 3
+   ->  Seq Scan on bo
+(6 rows)
+
+SELECT bo.tag, e.id, e.salary FROM bo LEFT JOIN emp e
+  ON e.id = bo.k AND e.salary > 150000 ORDER BY bo.tag;
+ tag |   id    | salary 
+-----+---------+--------
+   1 |         |       
+   2 |         |       
+   3 |         |       
+   4 |         |       
+   5 |         |       
+   6 | e000010 | 268000
+   7 | e000003 | 187000
+   8 | e000010 | 268000
+(8 rows)
+
+SELECT bo.tag, e.id FROM bo LEFT JOIN emp e ON e.id = bo.k
+  WHERE e.salary > 150000 OR bo.tag > 4 ORDER BY bo.tag;
+ tag |   id    
+-----+---------
+   5 | 
+   6 | e000010
+   7 | e000003
+   8 | e000010
+(4 rows)
+
+-- 1000 outer rows, about half of them with no HBase row
+CREATE TABLE bo2 AS SELECT g AS oid,
+  'e' || lpad((g * 37 % 20000 + 1)::text, 6, '0') AS k FROM generate_series(1, 1000) g;
+ANALYZE bo2;
+-- force the batched join (K = 500) so these check it, not a hash join
+SET hbase_fdw.join_batch = 500;
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_nestloop = off;
+SELECT count(*) AS rows, count(e.id) AS matched FROM bo2 o LEFT JOIN emp e ON e.id = o.k;
+ rows | matched 
+------+---------
+ 1000 |     540
+(1 row)
+
+SELECT count(*) AS diff FROM (
+  (SELECT o.oid, e.name FROM bo2 o LEFT JOIN emp e ON e.id = o.k
+   EXCEPT ALL SELECT o.oid, l.name FROM bo2 o LEFT JOIN emp_local l ON l.id = o.k)
+  UNION ALL
+  (SELECT o.oid, l.name FROM bo2 o LEFT JOIN emp_local l ON l.id = o.k
+   EXCEPT ALL SELECT o.oid, e.name FROM bo2 o LEFT JOIN emp e ON e.id = o.k)) d;
+ diff 
+------
+    0
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(e.name) FROM bo2 o LEFT JOIN emp e ON e.id = o.k;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Custom Scan (HBase Batched Join) (actual rows=1000.00 loops=1)
+         Join Type: Left
+         Join Cond: (id = k)
+         HBase Table: emp
+         Batch Size: 500
+         Batches: 2
+         HBase RPCs: 2
+         ->  Seq Scan on bo2 o (actual rows=1000.00 loops=1)
+(9 rows)
+
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_nestloop;
 -- switched off: back to the parameterized nested loop or a hash join
 SET hbase_fdw.batch_join = off;
 EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo JOIN emp e ON e.id = bo.k;
@@ -170,7 +277,7 @@ EXPLAIN (COSTS OFF) SELECT bo.tag, e.name FROM bo JOIN emp e ON e.id = bo.k;
                HBase Key Cond: (id = bo.k)
 (9 rows)
 
-DROP TABLE bo, bo1k, emp_local;
+DROP TABLE bo, bo1k, bo2, emp_local;
 DROP FUNCTION bj_diff();
 DROP EXTENSION hbase_fdw CASCADE;
 NOTICE:  drop cascades to 2 other objects
