@@ -230,6 +230,7 @@ static int	nsrv = 0;
 static Oid	w_srv[MAXSRV];
 static double w_rtt[MAXSRV];	/* ms: best ping, the bare network round trip */
 static double w_call[MAXSRV];	/* ms: best 1-key get, round trip + HBase work */
+static double w_key[MAXSRV];	/* ms: HBase work per extra key in a get */
 static double w_conn[MAXSRV];	/* ms */
 static double w_bytes[MAXSRV];	/* bytes in big replies ... */
 static double w_ms[MAXSRV];		/* ... and their time beyond one call */
@@ -266,11 +267,13 @@ ncells(HbRow *r, int n)
 }
 
 static void rel_seen(Oid relid, double bytes, double cells);
+static double srv_bw(int i);
 
 /*
  * Slot of a server, measuring it the first time in this session:
  *  - best of 3 pings = rtt (reported; bare network)
  *  - best of 2 one-key gets = the cost of a call (what every RPC really pays)
+ *  - a 100-key get: the extra time per key beyond the first
  *  - the 2nd batch of up to 1000 whole rows = bandwidth and bytes per cell
  *    (the 1st batch also pays for HBase warming up its scanner)
  * About 8 round trips, once per session.
@@ -286,7 +289,8 @@ find_srv(Oid srv, HbOpts *o, Oid relid)
 	HbScanSpec	sp = {0};
 	HbRow	   *r1,
 			   *r2;
-	HbKey		key;
+	HbKey		key,
+			   *ks;
 	int32		id;
 	double		in,
 				ms,
@@ -306,7 +310,7 @@ find_srv(Oid srv, HbOpts *o, Oid relid)
 	w_srv[i] = srv;
 	w_conn[i] = hb_conn_ms(c);
 	w_rtt[i] = w_call[i] = 1e9;
-	w_bytes[i] = w_ms[i] = 0;
+	w_key[i] = w_bytes[i] = w_ms[i] = 0;
 	for (k = 0; k < 3; k++)
 	{
 		hb_ping(c, o->table);
@@ -345,6 +349,32 @@ find_srv(Oid srv, HbOpts *o, Oid relid)
 	{
 		w_bytes[i] = in;
 		w_ms[i] = ms - w_call[i];
+	}
+	if (n >= 100 && r1[0].ncells > 0)
+	{
+		double		t = 1e9;
+		HbCell	   *x = &r1[0].cells[0];
+		char	   *colon = memchr(x->col, ':', x->collen);
+		char	   *none = psprintf("%.*s:hbase_fdw_none",
+									(int) (colon ? colon - x->col : x->collen), x->col);
+
+		ks = palloc(sizeof(HbKey) * 100);
+		for (k = 0; k < 100; k++)
+		{
+			ks[k].p = r1[k].key;
+			ks[k].len = r1[k].keylen;
+		}
+		/*
+		 * Ask for a column no row has: HBase still looks up every key, but
+		 * the reply is empty, so this times the per-key work alone (a big
+		 * reply can stall on TCP delayed ACKs and say nothing about keys).
+		 */
+		for (k = 0; k < 2; k++)
+		{
+			hb_get_rows(c, o->table, ks, 100, &none, 1, &r2);
+			t = Min(t, hb_last_ms(c) - w_call[i]);
+		}
+		w_key[i] = Max(0, t / 99);
 	}
 	hb_disconnect(c);
 	MemoryContextSwitchTo(old);
@@ -996,6 +1026,8 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 		msu = (required_outer ? 0 : w_conn[i]) + srv_call(i);
 		mtot = msu + (rpcs - 1) * srv_call(i) + fetched * bpr / srv_bw(i) +
 			fetched * row_us / 1000.0;
+		if (get)				/* keys beyond one per call */
+			mtot += Max(0, fetched - rpcs) * w_key[i];
 		su = msu * cpm + qc.startup;
 		tot = mtot * cpm + qc.startup + fetched * (cpu_tuple_cost + qc.per_tuple);
 	}
@@ -1812,10 +1844,10 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 		if (i >= 0)
 		{
-			char		b[160];
+			char		b[192];
 
-			snprintf(b, sizeof(b), "rtt %.2f ms, call %.2f ms, bandwidth %.0f Mbit/s, %.0f bytes/cell",
-					 force_rtt >= 0 ? force_rtt : w_rtt[i], srv_call(i),
+			snprintf(b, sizeof(b), "rtt %.2f ms, call %.2f ms, +%.3f ms/key, bandwidth %.0f Mbit/s, %.0f bytes/cell",
+					 force_rtt >= 0 ? force_rtt : w_rtt[i], srv_call(i), w_key[i],
 					 srv_bw(i) * 8 / 1000.0, rel_bpc(relid));
 			ExplainPropertyText("Network", b, es);
 		}
@@ -1877,14 +1909,15 @@ bj_cost(RelOptInfo *inner, Oid relid, double n, double out, Cost *su, Cost *tot)
 	double		rpcs = b * ceil((double) join_batch / ri->o.batch);
 
 	rpcs = Max(1, Min(rpcs, b * ceil(n / b / ri->o.batch)));
+	out = Min(out, n);			/* a key lookup returns at most one row per key */
 	if (adaptive)
 	{
 		int			i = find_srv(GetForeignTable(relid)->serverid, &ri->o, relid);
 		double		bpr = Max(1, bms_num_members(ri->used)) * rel_bpc(relid);
 
 		*su = (w_conn[i] + srv_call(i)) * cpm;
-		*tot = (w_conn[i] + rpcs * srv_call(i) + out * bpr / srv_bw(i) +
-				out * row_us / 1000.0) * cpm;
+		*tot = (w_conn[i] + rpcs * srv_call(i) + Max(0, n - rpcs) * w_key[i] +
+				out * bpr / srv_bw(i) + out * row_us / 1000.0) * cpm;
 	}
 	else
 	{
