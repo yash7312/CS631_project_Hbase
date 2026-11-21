@@ -219,6 +219,7 @@ typedef struct HbState
 	int			n,
 				pos;
 	long		nrpc;			/* scannerGetList + getRowsWithColumns calls */
+	int			lim;			/* LIMIT pushed down: rows per scanner call, 0 = none */
 	long		nrows;			/* rows fetched from HBase */
 	double		ncell;			/* and their cells, the key counted as one */
 	int			wi;				/* slot in the weight arrays, -1 = none yet */
@@ -1153,6 +1154,36 @@ hbGetForeignPaths(PlannerInfo *root, RelOptInfo *rel, Oid relid)
 	}
 }
 
+/*
+ * LIMIT n: a scan only needs n rows per HBase call instead of batch_size.
+ * Only when nothing above can drop or reorder rows: one table, not the
+ * inner side of a join, no sort above it, and every WHERE condition is a
+ * row-key comparison HBase evaluates exactly (a LIKE pattern may have more
+ * after its prefix, so not those). Returns n, or 0 for "fetch as usual".
+ * Correctness never depends on it: the scan keeps fetching if more rows
+ * are needed, only in smaller calls.
+ */
+static int
+scan_limit(PlannerInfo *root, ForeignPath *best, int nquals, List *kops)
+{
+	ListCell   *lc;
+
+	if (root->limit_tuples <= 0 || root->limit_tuples > 100000)
+		return 0;
+	if (best->path.param_info != NULL ||
+		bms_membership(root->all_baserels) != BMS_SINGLETON)
+		return 0;
+	if (root->query_pathkeys != NIL &&
+		!pathkeys_contained_in(root->query_pathkeys, best->path.pathkeys))
+		return 0;				/* a Sort above needs every row */
+	if (list_length(kops) != nquals)
+		return 0;				/* some condition is checked only here */
+	foreach(lc, kops)
+		if (lfirst_int(lc) == KC_LIKE || lfirst_int(lc) == KC_IN)
+			return 0;
+	return (int) ceil(root->limit_tuples);
+}
+
 static ForeignScan *
 hbGetForeignPlan(PlannerInfo *root, RelOptInfo *rel, Oid relid,
 				 ForeignPath *best, List *tlist, List *clauses, Plan *outer)
@@ -1163,7 +1194,8 @@ hbGetForeignPlan(PlannerInfo *root, RelOptInfo *rel, Oid relid,
 			   *kexprs = NIL,
 			   *kops = NIL;
 	char	   *kname;
-	int			k = -1;
+	int			k = -1,
+				nquals;
 
 	/* row-key conditions (with join clauses, if parameterized) go to HBase */
 	key_conds(rel, ri->katt, clauses, &kexprs, &kops, NULL);
@@ -1171,6 +1203,7 @@ hbGetForeignPlan(PlannerInfo *root, RelOptInfo *rel, Oid relid,
 		get_attname(relid, ri->katt, false);
 
 	/* every qual is still checked locally by the executor */
+	nquals = list_length(clauses);
 	clauses = extract_actual_clauses(clauses, false);
 
 	/* attnos needed (0 = whole row, i.e. everything) */
@@ -1183,7 +1216,9 @@ hbGetForeignPlan(PlannerInfo *root, RelOptInfo *rel, Oid relid,
 	}
 
 	return make_foreignscan(tlist, clauses, rel->relid, kexprs,
-							list_make3(atts, kops, makeString(kname)), NIL, NIL, outer);
+							list_make4(atts, kops, makeString(kname),
+									   makeInteger(scan_limit(root, best, nquals, kops))),
+							NIL, NIL, outer);
 }
 
 /* ---------- execution ---------- */
@@ -1299,6 +1334,7 @@ hbBeginForeignScan(ForeignScanState *node, int eflags)
 	get_opts(RelationGetRelid(rel), &st->o);
 	setup_cols(st, rel, (List *) linitial(fs->fdw_private));
 	st->kname = strVal(lthird(fs->fdw_private));
+	st->lim = intVal(lfourth(fs->fdw_private));
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
@@ -1713,7 +1749,7 @@ hbIterateForeignScan(ForeignScanState *node)
 		s.stoplen = st->stoplen;
 		s.ncols = st->nh;
 		s.cols = st->hcols;
-		s.caching = st->o.batch;
+		s.caching = st->lim > 0 ? Min(st->o.batch, st->lim) : st->o.batch;
 		s.keyonly = st->keyonly;
 		st->sid = hb_scan_open(st->conn, st->o.table, &s);
 		st->open = true;
@@ -1738,7 +1774,9 @@ hbIterateForeignScan(ForeignScanState *node)
 			st->eof = (st->kpos >= st->nkeys);
 		}
 		else
-			st->n = hb_scan_next(st->conn, st->sid, st->o.batch, &st->rows);
+			st->n = hb_scan_next(st->conn, st->sid,
+								 st->lim > 0 ? Min(st->o.batch, st->lim) : st->o.batch,
+								 &st->rows);
 		MemoryContextSwitchTo(old);
 		st->pos = 0;
 		st->nrpc++;
@@ -1870,6 +1908,8 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		if (st->keyonly)
 			ExplainPropertyText("HBase Filter", "FirstKeyOnlyFilter() AND KeyOnlyFilter()", es);
 		ExplainPropertyInteger("Batch Size", NULL, st->o.batch, es);
+		if (st->lim > 0)
+			ExplainPropertyInteger("HBase Row Limit", NULL, st->lim, es);
 	}
 	if (es->analyze)
 		ExplainPropertyInteger("HBase RPCs", NULL, st->nrpc, es);

@@ -380,6 +380,21 @@ SELECT * FROM deadt;
 -- connection still fine after errors
 SELECT count(*) FROM emp;
 
+-- LIMIT pushdown: a plain scan asks HBase for only n rows per call
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp LIMIT 3;
+SELECT hb_explain($$SELECT id FROM emp LIMIT 3$$);
+SELECT count(*) FROM (SELECT * FROM emp LIMIT 3) s;
+-- in key order too (C collation): rows already come out sorted, no Sort above
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp_c ORDER BY id LIMIT 3;
+SELECT id FROM emp_c ORDER BY id LIMIT 3;
+SELECT hb_explain($$SELECT id FROM emp_c ORDER BY id OFFSET 998 LIMIT 3$$);
+SELECT id FROM emp_c ORDER BY id OFFSET 998 LIMIT 3;
+-- not pushed when something above may need more rows: a local filter,
+-- a sort on another column, a join
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp WHERE salary > 0 LIMIT 3;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp ORDER BY name LIMIT 3;
+SELECT count(*) FROM (SELECT e.id FROM emp e JOIN emp_local l ON l.id = e.id LIMIT 3) s;
+
 DROP TABLE emp_local;
 DROP FUNCTION hb_explain(text);
 DROP FUNCTION hb_rows(text);

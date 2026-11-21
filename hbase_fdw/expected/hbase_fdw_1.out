@@ -1486,6 +1486,110 @@ SELECT count(*) FROM emp;
  10000
 (1 row)
 
+-- LIMIT pushdown: a plain scan asks HBase for only n rows per call
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp LIMIT 3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Limit
+   Output: id
+   ->  Foreign Scan on public.emp
+         Output: id
+         HBase Table: emp
+         HBase Columns: info:name
+         HBase Filter: FirstKeyOnlyFilter() AND KeyOnlyFilter()
+         Batch Size: 500
+         HBase Row Limit: 3
+(9 rows)
+
+SELECT hb_explain($$SELECT id FROM emp LIMIT 3$$);
+        hb_explain         
+---------------------------
+   ->  Foreign Scan on emp
+         HBase Table: emp
+         HBase RPCs: 1
+(3 rows)
+
+SELECT count(*) FROM (SELECT * FROM emp LIMIT 3) s;
+ count 
+-------
+     3
+(1 row)
+
+-- in key order too (C collation): rows already come out sorted, no Sort above
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp_c ORDER BY id LIMIT 3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Limit
+   Output: id
+   ->  Foreign Scan on public.emp_c
+         Output: id
+         HBase Table: emp
+         HBase Families: pay
+         HBase Filter: FirstKeyOnlyFilter() AND KeyOnlyFilter()
+         Batch Size: 1000
+         HBase Row Limit: 3
+(9 rows)
+
+SELECT id FROM emp_c ORDER BY id LIMIT 3;
+   id    
+---------
+ e000001
+ e000002
+ e000003
+(3 rows)
+
+SELECT hb_explain($$SELECT id FROM emp_c ORDER BY id OFFSET 998 LIMIT 3$$);
+         hb_explain          
+-----------------------------
+   ->  Foreign Scan on emp_c
+         HBase Table: emp
+         HBase RPCs: 2
+(3 rows)
+
+SELECT id FROM emp_c ORDER BY id OFFSET 998 LIMIT 3;
+   id    
+---------
+ e000999
+ e001000
+ e001001
+(3 rows)
+
+-- not pushed when something above may need more rows: a local filter,
+-- a sort on another column, a join
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp WHERE salary > 0 LIMIT 3;
+                  QUERY PLAN                  
+----------------------------------------------
+ Limit
+   Output: id
+   ->  Foreign Scan on public.emp
+         Output: id
+         Filter: (emp.salary > 0)
+         HBase Table: emp
+         HBase Columns: pay:salary, info:name
+         Batch Size: 500
+(8 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM emp ORDER BY name LIMIT 3;
+               QUERY PLAN               
+----------------------------------------
+ Limit
+   Output: id, name
+   ->  Sort
+         Output: id, name
+         Sort Key: emp.name
+         ->  Foreign Scan on public.emp
+               Output: id, name
+               HBase Table: emp
+               HBase Columns: info:name
+               Batch Size: 500
+(10 rows)
+
+SELECT count(*) FROM (SELECT e.id FROM emp e JOIN emp_local l ON l.id = e.id LIMIT 3) s;
+ count 
+-------
+     3
+(1 row)
+
 DROP TABLE emp_local;
 DROP FUNCTION hb_explain(text);
 DROP FUNCTION hb_rows(text);

@@ -370,6 +370,11 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   or LEFT join on the row key, the batched join (`hbase_fdw.batch_join`)
   fetches K outer keys per call instead (v1: the outer key must be a plain
   column, no subqueries in the join clauses).
+- **LIMIT.** A plain scan under `LIMIT n` asks HBase for n rows per call
+  instead of `batch_size` (EXPLAIN VERBOSE: `HBase Row Limit`), but only
+  when nothing above it can drop or reorder rows: one table, no join, no
+  sort on another column, and every WHERE condition a pushed row-key
+  comparison. Otherwise the scan fetches full batches as before.
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
   - No rollback: each row is written to HBase at once, so `ROLLBACK` does
