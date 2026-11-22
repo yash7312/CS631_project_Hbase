@@ -21,15 +21,16 @@ CREATE FOREIGN TABLE emp (
 CREATE FOREIGN TABLE emp_c (
   id     text OPTIONS (rowkey 'true') COLLATE "C",
   salary int  OPTIONS (column 'pay:salary')
-) SERVER hb OPTIONS (table 'emp', rows '10000', batch_size '10');
+) SERVER hb OPTIONS (table 'emp', rows '1000000');
 CREATE TABLE emp_local (id text PRIMARY KEY, name text, dept text,
                         joined date, salary int, bonus numeric(10,2));
 \copy emp_local from 'test/emp.csv' with (format csv)
 
--- make Gather free so the parallel plan is chosen
+-- make Gather free so the parallel plan is chosen; up to 3 workers, so
+-- 4 regions (the mock) take 3 workers, 1 region (real HBase emp) no Gather
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
-SET max_parallel_workers_per_gather = 2;
+SET max_parallel_workers_per_gather = 3;
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM emp;
 SELECT count(*), count(DISTINCT id), min(id), max(id), sum(salary) FROM emp;
@@ -41,7 +42,7 @@ SELECT count(*) AS diff FROM (
   (SELECT * FROM emp_local EXCEPT ALL SELECT * FROM emp)) d;
 
 -- a key range across region edges: only the regions it touches, clipped
--- (a range is guessed at 50 rows: batch_size 10 lets 3 processes share it)
+-- (a range is guessed at 0.5% of the table: rows 1000000 makes that 5000)
 EXPLAIN (COSTS OFF) SELECT count(*) FROM emp_c WHERE id >= 'e002000' AND id < 'e005600';
 SELECT count(*), min(id), max(id) FROM emp_c WHERE id >= 'e002000' AND id < 'e005600';
 SELECT count(*), min(id), max(id) FROM emp_c WHERE id > 'e007400';

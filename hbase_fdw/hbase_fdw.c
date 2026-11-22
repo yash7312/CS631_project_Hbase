@@ -115,7 +115,7 @@ static bool full_scan = true;
 static int	join_batch = 500;	/* outer rows per batch, K */
 
 /* parallel scan (stage 3): workers per plain scan, 0 = never parallel */
-static int	par_workers = 2;
+static int	par_workers = 8;
 
 typedef struct Opt
 {
@@ -265,6 +265,41 @@ static int	nrel = 0;
 static Oid	r_rel[MAXREL];
 static double r_bytes[MAXREL];
 static double r_cells[MAXREL];
+
+/* per foreign table: how many regions it has, asked once per session */
+static int	ngr = 0;
+static Oid	g_rel[MAXREL];
+static int	g_n[MAXREL];
+
+static int
+rel_regions(Oid relid, HbOpts *o)
+{
+	int			i,
+				n;
+	HbConn	   *c;
+	HbKey	   *st,
+			   *en;
+	MemoryContext cx,
+				old;
+
+	for (i = 0; i < ngr; i++)
+		if (g_rel[i] == relid)
+			return g_n[i];
+	cx = AllocSetContextCreate(CurrentMemoryContext, "hbase_fdw regions",
+							   ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(cx);
+	c = hb_connect(o->host, o->port, o->tmo * 1000);
+	n = hb_regions(c, o->table, &st, &en);
+	hb_disconnect(c);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cx);
+	if (ngr < MAXREL)
+	{
+		g_rel[ngr] = relid;
+		g_n[ngr++] = n;
+	}
+	return n;
+}
 
 /* slot of a server already measured, or -1 */
 static int
@@ -1039,7 +1074,8 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 	Cost		su,
 				tot,
 				net = 0;		/* the bytes / bandwidth part of tot */
-	int			nw;
+	int			nw,
+				nr;
 	List	   *pk = key_pathkeys(root, rel, relid, ri->katt);
 	ForeignPath *p;
 
@@ -1095,30 +1131,41 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 	add_path(rel, (Path *) p);
 
 	/*
-	 * Parallel scan: nw workers and the leader each scan whole regions. The
-	 * round trips and per-row work split nw + 1 ways; the bytes still cross
-	 * one network link, so that part does not shrink. Each region costs
-	 * about 3 extra calls (open, last empty batch, close). Not worth it
-	 * unless every process gets at least one full batch of rows.
+	 * Parallel scan: the leader and nw workers each scan whole regions, so
+	 * the busiest one scans k = ceil(regions / (nw + 1)) of them and the
+	 * scan takes about k / regions of the serial round trips and row work.
+	 * nw is the fewest workers that reach the smallest k (4 regions and at
+	 * most 2 workers: 1 worker, 2 regions each). Each region costs about 3
+	 * extra calls (open, last empty batch, close). The bytes still cross one
+	 * network link, so that part does not shrink. Only when every process
+	 * gets at least one full batch, and the table has 2 or more regions.
 	 */
 	nw = Min(par_workers, max_parallel_workers_per_gather);
 	if (nw > 0 && !get && !required_outer && rel->consider_parallel &&
-		fetched >= (double) ri->o.batch * (nw + 1))
+		fetched >= (double) ri->o.batch * 2 &&
+		(nr = rel_regions(relid, &ri->o)) > 1)
 	{
-		double		d = nw + 1;
-		Cost		c3 = 3 * nw * (adaptive ? srv_call(find_srv(GetForeignTable(relid)->serverid,
-																   &ri->o, relid)) * cpm
-								   : HB_RPC_COST);
-		Cost		ptot = su + (tot - su - net + c3) / d + net;
+		int			k;
+		double		call;
+		Cost		ptot;
+
+		nw = Min(nw, nr - 1);
+		k = (nr + nw) / (nw + 1);		/* ceil(nr / (nw + 1)) */
+		nw = (nr + k - 1) / k - 1;		/* fewest workers for that k */
+		if (adaptive)
+			call = srv_call(find_srv(GetForeignTable(relid)->serverid, &ri->o, relid)) * cpm;
+		else
+			call = HB_RPC_COST;
+		ptot = su + (tot - su - net + 3 * (nr - 1) * call) * k / nr + net;
 
 #if PG_VERSION_NUM >= 180000
-		p = create_foreignscan_path(root, rel, NULL, rows / d, dis ? 1 : 0, su, ptot,
+		p = create_foreignscan_path(root, rel, NULL, rows / (nw + 1), dis ? 1 : 0, su, ptot,
 									NIL, NULL, NULL, NIL, NIL);
 #elif PG_VERSION_NUM >= 170000
-		p = create_foreignscan_path(root, rel, NULL, rows / d, su, ptot,
+		p = create_foreignscan_path(root, rel, NULL, rows / (nw + 1), su, ptot,
 									NIL, NULL, NULL, NIL, NIL);
 #else
-		p = create_foreignscan_path(root, rel, NULL, rows / d, su, ptot,
+		p = create_foreignscan_path(root, rel, NULL, rows / (nw + 1), su, ptot,
 									NIL, NULL, NULL, NIL);
 #endif
 		p->path.parallel_aware = true;
@@ -2785,7 +2832,7 @@ _PG_init(void)
 	DefineCustomIntVariable("hbase_fdw.parallel_workers",
 							"Workers for a parallel scan of an HBase table, 0 = no parallel scans.",
 							"Each worker and the leader scan whole regions.",
-							&par_workers, 2, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
+							&par_workers, 8, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("hbase_fdw");
 	bj_init();
 }

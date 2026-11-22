@@ -377,16 +377,20 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   comparison. Otherwise the scan fetches full batches as before.
 - **Parallel scans.** A plain scan (no `=`/`IN` key lookup, not the inner
   side of a lookup join) can run as a `Parallel Foreign Scan` under a
-  `Gather`. The leader asks HBase for the table's regions
-  (`getTableRegions`) and puts them in shared memory. The leader and each
-  worker take the next region with an atomic counter and scan only the part
-  of it inside the key range, each over its own connection. Workers:
-  `hbase_fdw.parallel_workers` (default 2, 0 = off), capped by
-  `max_parallel_workers_per_gather`. It is only offered when every process
-  gets at least one full batch. The cost splits round trips and row work
-  across the processes, but not bytes, because they all share one network
-  link. A table with one region gains nothing. EXPLAIN ANALYZE shows `HBase
-  Regions` and the leader's own counts: workers keep theirs.
+  `Gather`. At plan time the FDW asks HBase once per session how many
+  regions the table has (`getTableRegions`). A table with one region is
+  never parallel. Otherwise it picks the fewest workers that still give each
+  process as few regions as possible: 4 regions and at most 2 workers means
+  1 worker scanning 2 regions, and 3 workers means 1 region each. The cap is
+  `hbase_fdw.parallel_workers` (default 8) and `max_parallel_workers_per_gather`.
+  At run time the leader puts the region keys in shared memory. The leader
+  and each worker take the next region with an atomic counter and scan only
+  the part of it inside the key range, each over its own connection. The
+  cost is the busiest process's share of round trips and row work, plus 3
+  calls per extra region. Bytes are not divided, because all processes share
+  one network link. It is only offered when the scan fetches at least two
+  batches. EXPLAIN ANALYZE shows `HBase Regions` and the leader's own counts:
+  workers keep theirs.
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
   - No rollback: each row is written to HBase at once, so `ROLLBACK` does

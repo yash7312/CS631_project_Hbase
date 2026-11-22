@@ -65,9 +65,10 @@ class Handler:
         return self._tab(name).on
 
     def getTableRegions(self, name):
-        # a mock "pre-split" table: a new region every 2500 rows
+        # a mock "pre-split" table: a new region every MOCK_REGION_ROWS rows
         t = self._tab(name)
-        cut = t.keys[2500::2500]
+        step = int(os.environ.get("MOCK_REGION_ROWS", "2500"))
+        cut = t.keys[step::step]
         st, en = [b""] + cut, cut + [b""]
         return [hb.TRegionInfo(startKey=x, endKey=y, id=i, name=b(name) + b"," + x,
                                version=1, serverName=b"mock", port=0)

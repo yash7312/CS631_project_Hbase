@@ -1,0 +1,145 @@
+-- parallel scan by region: the leader and the workers each claim whole
+-- regions; the mock splits a table every 2500 rows, real HBase may have one
+-- region, the results must be the same either way
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS hbase_fdw CASCADE;
+CREATE EXTENSION hbase_fdw;
+RESET client_min_messages;
+SET hbase_fdw.adaptive_costs = off;
+SET hbase_fdw.batch_join = off;
+CREATE SERVER hb FOREIGN DATA WRAPPER hbase_fdw
+  OPTIONS (host 'localhost', port '9090');
+CREATE FOREIGN TABLE emp (
+  id     text OPTIONS (rowkey 'true'),
+  name   text OPTIONS (column 'info:name') NOT NULL,
+  dept   text OPTIONS (column 'info:dept'),
+  joined date OPTIONS (column 'info:joined'),
+  salary int  OPTIONS (column 'pay:salary'),
+  bonus  numeric(10,2) OPTIONS (column 'pay:bonus')
+) SERVER hb OPTIONS (table 'emp', rows '10000');
+CREATE FOREIGN TABLE emp_c (
+  id     text OPTIONS (rowkey 'true') COLLATE "C",
+  salary int  OPTIONS (column 'pay:salary')
+) SERVER hb OPTIONS (table 'emp', rows '1000000');
+CREATE TABLE emp_local (id text PRIMARY KEY, name text, dept text,
+                        joined date, salary int, bonus numeric(10,2));
+\copy emp_local from 'test/emp.csv' with (format csv)
+-- make Gather free so the parallel plan is chosen; up to 3 workers, so
+-- 4 regions (the mock) take 3 workers, 1 region (real HBase emp) no Gather
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET max_parallel_workers_per_gather = 3;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM emp;
+        QUERY PLAN         
+---------------------------
+ Aggregate
+   ->  Foreign Scan on emp
+         HBase Table: emp
+(3 rows)
+
+SELECT count(*), count(DISTINCT id), min(id), max(id), sum(salary) FROM emp;
+ count | count |   min   |   max   |    sum     
+-------+-------+---------+---------+------------
+ 10000 | 10000 | e000001 | e010000 | 1653220000
+(1 row)
+
+-- every row exactly once, same as the local copy
+SELECT count(*) AS diff FROM (
+  (SELECT * FROM emp EXCEPT ALL SELECT * FROM emp_local)
+  UNION ALL
+  (SELECT * FROM emp_local EXCEPT ALL SELECT * FROM emp)) d;
+ diff 
+------
+    0
+(1 row)
+
+-- a key range across region edges: only the regions it touches, clipped
+-- (a range is guessed at 0.5% of the table: rows 1000000 makes that 5000)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM emp_c WHERE id >= 'e002000' AND id < 'e005600';
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on emp_c
+         Filter: ((id >= 'e002000'::text) AND (id < 'e005600'::text))
+         HBase Table: emp
+         HBase Key Cond: (id >= 'e002000'::text) AND (id < 'e005600'::text)
+(5 rows)
+
+SELECT count(*), min(id), max(id) FROM emp_c WHERE id >= 'e002000' AND id < 'e005600';
+ count |   min   |   max   
+-------+---------+---------
+  3600 | e002000 | e005599
+(1 row)
+
+SELECT count(*), min(id), max(id) FROM emp_c WHERE id > 'e007400';
+ count |   min   |   max   
+-------+---------+---------
+  2600 | e007401 | e010000
+(1 row)
+
+SELECT count(*) FROM emp_c WHERE id >= 'e002501' AND id < 'e002501';
+ count 
+-------
+     0
+(1 row)
+
+-- key lookups are never parallel
+EXPLAIN (COSTS OFF) SELECT * FROM emp_c WHERE id = 'e000005';
+                QUERY PLAN                
+------------------------------------------
+ Foreign Scan on emp_c
+   Filter: (id = 'e000005'::text)
+   HBase Table: emp
+   HBase Key Cond: (id = 'e000005'::text)
+(4 rows)
+
+-- the Gather is rescanned for every outer row: regions are handed out again
+-- (a temp table cannot be read by workers, so it stays outside the Gather)
+CREATE TEMP TABLE three (n int);
+INSERT INTO three VALUES (1), (2), (3);
+ANALYZE three;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+EXPLAIN (COSTS OFF)
+SELECT t.n, count(*) FROM three t JOIN emp_c e ON e.salary > t.n * 100000 GROUP BY 1 ORDER BY 1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
+   Sort Key: t.n
+   ->  HashAggregate
+         Group Key: t.n
+         ->  Nested Loop
+               Join Filter: (e.salary > (t.n * 100000))
+               ->  Seq Scan on three t
+               ->  Foreign Scan on emp_c e
+                     HBase Table: emp
+(9 rows)
+
+SELECT t.n, count(*) FROM three t JOIN emp_c e ON e.salary > t.n * 100000 GROUP BY 1 ORDER BY 1;
+ n | count 
+---+-------
+ 1 |  7336
+ 2 |  3734
+(2 rows)
+
+SELECT t.n, count(*) FROM three t JOIN emp_local e ON e.salary > t.n * 100000 GROUP BY 1 ORDER BY 1;
+ n | count 
+---+-------
+ 1 |  7336
+ 2 |  3734
+(2 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+-- off
+SET hbase_fdw.parallel_workers = 0;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM emp;
+        QUERY PLAN         
+---------------------------
+ Aggregate
+   ->  Foreign Scan on emp
+         HBase Table: emp
+(3 rows)
+
