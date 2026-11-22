@@ -390,8 +390,12 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   and bytes), plus 3 calls per extra region. With measured costs it also
   credits back most of Gather's fixed charges: `parallel_setup_cost` (50 ms
   on our scale) and `parallel_tuple_cost` (5 us a row). Real HBase showed
-  about 1 ms per worker and 2 us per row. It is only offered when the scan
-  fetches at least two batches. EXPLAIN ANALYZE shows `HBase Regions` and the leader's own counts:
+  about 1 ms per worker and 2 us per row. The credit cannot take the path
+  below zero, so a scan that costs less than Gather's 50 ms charge stays
+  serial. On real HBase that is a loopback scan (RTT 0: 27 ms serial, 14 ms
+  with 3 workers). `SET parallel_setup_cost = 100` (5 ms) lets the planner
+  pick parallel there too. It is only offered when the scan fetches at
+  least two batches. EXPLAIN ANALYZE shows `HBase Regions` and the leader's own counts:
   workers keep theirs.
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
