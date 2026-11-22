@@ -76,6 +76,9 @@ extern void hb_mutate_rows(HbConn *c, const char *table, const HbKey *keys,
 						   HbMut *m, int ncol, int n);
 extern void hb_delete_row(HbConn *c, const char *table, const char *key, int klen);
 
+/* region boundaries, for parallel scans; an empty key = open end */
+extern int	hb_regions(HbConn *c, const char *table, HbKey **st, HbKey **en);
+
 /* for measured costs (Part B) */
 extern void hb_ping(HbConn *c, const char *table);
 extern double hb_last_ms(HbConn *c);	/* time of the last call, ms */

@@ -375,6 +375,18 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   when nothing above it can drop or reorder rows: one table, no join, no
   sort on another column, and every WHERE condition a pushed row-key
   comparison. Otherwise the scan fetches full batches as before.
+- **Parallel scans.** A plain scan (no `=`/`IN` key lookup, not the inner
+  side of a lookup join) can run as a `Parallel Foreign Scan` under a
+  `Gather`. The leader asks HBase for the table's regions
+  (`getTableRegions`) and puts them in shared memory. The leader and each
+  worker take the next region with an atomic counter and scan only the part
+  of it inside the key range, each over its own connection. Workers:
+  `hbase_fdw.parallel_workers` (default 2, 0 = off), capped by
+  `max_parallel_workers_per_gather`. It is only offered when every process
+  gets at least one full batch. The cost splits round trips and row work
+  across the processes, but not bytes, because they all share one network
+  link. A table with one region gains nothing. EXPLAIN ANALYZE shows `HBase
+  Regions` and the leader's own counts: workers keep theirs.
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.
   - No rollback: each row is written to HBase at once, so `ROLLBACK` does

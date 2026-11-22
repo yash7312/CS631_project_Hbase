@@ -64,6 +64,15 @@ class Handler:
     def isTableEnabled(self, name):
         return self._tab(name).on
 
+    def getTableRegions(self, name):
+        # a mock "pre-split" table: a new region every 2500 rows
+        t = self._tab(name)
+        cut = t.keys[2500::2500]
+        st, en = [b""] + cut, cut + [b""]
+        return [hb.TRegionInfo(startKey=x, endKey=y, id=i, name=b(name) + b"," + x,
+                               version=1, serverName=b"mock", port=0)
+                for i, (x, y) in enumerate(zip(st, en))]
+
     def getColumnDescriptors(self, name):
         return {f + b":": hb.ColumnDescriptor(name=f + b":")
                 for f in self._tab(name).fams}

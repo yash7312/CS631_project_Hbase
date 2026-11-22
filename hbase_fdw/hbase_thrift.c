@@ -983,6 +983,60 @@ hb_ping(HbConn *c, const char *tab)
 	done(c);
 }
 
+/* getTableRegions: start and end key of every region, in key order */
+int
+hb_regions(HbConn *c, const char *tab, HbKey **st, HbKey **en)
+{
+	static const char *fn = "getTableRegions";
+	int			ft,
+				n = 0,
+				i;
+
+	*st = *en = NULL;
+	wmsg(c, fn);
+	wfld(c, T_STRING, 1);
+	wstr(c, tab, strlen(tab));
+	w8(c, T_STOP);
+	flush(c);
+
+	rmsg(c, fn);
+	while ((ft = r8(c)) != T_STOP)
+	{
+		int			fid = r16(c);
+
+		if (fid == 0 && ft == T_LIST)
+		{
+			if (r8(c) != T_STRUCT)
+				proto_err("bad list<TRegionInfo>");
+			n = rlen(c);
+			*st = palloc0(sizeof(HbKey) * Max(n, 1));
+			*en = palloc0(sizeof(HbKey) * Max(n, 1));
+			for (i = 0; i < n; i++)
+			{
+				int			t;
+
+				while ((t = r8(c)) != T_STOP)
+				{
+					int			id = r16(c);
+
+					if (id == 1 && t == T_STRING)
+						(*st)[i].p = rstr(c, &(*st)[i].len);
+					else if (id == 2 && t == T_STRING)
+						(*en)[i].p = rstr(c, &(*en)[i].len);
+					else
+						skip(c, t, 0);
+				}
+			}
+		}
+		else if (fid == 1 && ft == T_STRUCT)
+			rexc(c, fn, 1);
+		else
+			skip(c, ft, 0);
+	}
+	done(c);
+	return n;
+}
+
 double		hb_last_ms(HbConn *c) { return c->lastms; }
 long		hb_last_in(HbConn *c) { return c->lastin; }
 long		hb_bytes_in(HbConn *c) { return c->nin; }

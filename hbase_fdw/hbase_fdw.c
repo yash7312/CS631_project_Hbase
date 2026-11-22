@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
 #include "access/table.h"
@@ -55,6 +56,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "port/atomics.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -111,6 +113,9 @@ static bool batch_join = true;
 /* for experiments, like enable_seqscan: off marks full HBase scans disabled */
 static bool full_scan = true;
 static int	join_batch = 500;	/* outer rows per batch, K */
+
+/* parallel scan (stage 3): workers per plain scan, 0 = never parallel */
+static int	par_workers = 2;
 
 typedef struct Opt
 {
@@ -223,6 +228,17 @@ typedef struct HbState
 	long		nrows;			/* rows fetched from HBase */
 	double		ncell;			/* and their cells, the key counted as one */
 	int			wi;				/* slot in the weight arrays, -1 = none yet */
+
+	/* parallel scan: every process claims the next region from par */
+	struct HbPar *par;			/* shared memory, NULL = scan alone */
+	HbKey	   *rs,				/* region start/end keys, "" = open end */
+			   *re;
+	int			nr;				/* regions in the table */
+	int			nreg;			/* regions this process scanned */
+	char	   *a,				/* [a, z) the current region's part of the scan */
+			   *z;
+	int			al,
+				zl;
 
 	/* for error context */
 	HbRow	   *cur;
@@ -1021,7 +1037,9 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 				dis;
 	QualCost	qc;
 	Cost		su,
-				tot;
+				tot,
+				net = 0;		/* the bytes / bandwidth part of tot */
+	int			nw;
 	List	   *pk = key_pathkeys(root, rel, relid, ri->katt);
 	ForeignPath *p;
 
@@ -1045,6 +1063,7 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 			mtot += Max(0, fetched - rpcs) * w_key[i];
 		su = msu * cpm + qc.startup;
 		tot = mtot * cpm + qc.startup + fetched * (cpu_tuple_cost + qc.per_tuple);
+		net = fetched * bpr / srv_bw(i) * cpm;
 	}
 	else
 	{
@@ -1074,6 +1093,39 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 								required_outer, NULL, NIL);
 #endif
 	add_path(rel, (Path *) p);
+
+	/*
+	 * Parallel scan: nw workers and the leader each scan whole regions. The
+	 * round trips and per-row work split nw + 1 ways; the bytes still cross
+	 * one network link, so that part does not shrink. Each region costs
+	 * about 3 extra calls (open, last empty batch, close). Not worth it
+	 * unless every process gets at least one full batch of rows.
+	 */
+	nw = Min(par_workers, max_parallel_workers_per_gather);
+	if (nw > 0 && !get && !required_outer && rel->consider_parallel &&
+		fetched >= (double) ri->o.batch * (nw + 1))
+	{
+		double		d = nw + 1;
+		Cost		c3 = 3 * nw * (adaptive ? srv_call(find_srv(GetForeignTable(relid)->serverid,
+																   &ri->o, relid)) * cpm
+								   : HB_RPC_COST);
+		Cost		ptot = su + (tot - su - net + c3) / d + net;
+
+#if PG_VERSION_NUM >= 180000
+		p = create_foreignscan_path(root, rel, NULL, rows / d, dis ? 1 : 0, su, ptot,
+									NIL, NULL, NULL, NIL, NIL);
+#elif PG_VERSION_NUM >= 170000
+		p = create_foreignscan_path(root, rel, NULL, rows / d, su, ptot,
+									NIL, NULL, NULL, NIL, NIL);
+#else
+		p = create_foreignscan_path(root, rel, NULL, rows / d, su, ptot,
+									NIL, NULL, NULL, NIL);
+#endif
+		p->path.parallel_aware = true;
+		p->path.parallel_safe = true;
+		p->path.parallel_workers = nw;
+		add_partial_path(rel, (Path *) p);
+	}
 }
 
 /* does this path read the whole table (no row-key condition at all)? */
@@ -1722,6 +1774,174 @@ set_bounds(ForeignScanState *node, HbState *st)
 	return j > 0;
 }
 
+/* ---------- parallel scan by region (stage 3) ---------- */
+
+/*
+ * Shared memory of one parallel scan: a counter and the regions' keys,
+ * packed as (int len, bytes) start then end, region after region. Every
+ * process (leader and workers) does next = next + 1 and scans that region,
+ * so each region is scanned exactly once, by whoever is free first.
+ */
+typedef struct HbPar
+{
+	pg_atomic_uint32 next;		/* next region to hand out */
+	int			n;				/* regions */
+	char		d[FLEXIBLE_ARRAY_MEMBER];
+} HbPar;
+
+/* claim regions until one overlaps [start, stop); false = none left */
+static bool
+next_region(HbState *st)
+{
+	for (;;)
+	{
+		uint32		i = pg_atomic_fetch_add_u32(&st->par->next, 1);
+		HbKey	   *r,
+				   *e;
+
+		if (i >= (uint32) st->nr)
+			return false;
+		r = &st->rs[i];
+		e = &st->re[i];
+		/* a = the later start, z = the earlier stop; NULL / "" = open */
+		st->a = st->start;
+		st->al = st->startlen;
+		if (r->len > 0 && (!st->a || kcmp(r->p, r->len, st->a, st->al) > 0))
+		{
+			st->a = r->p;
+			st->al = r->len;
+		}
+		st->z = st->stop;
+		st->zl = st->stoplen;
+		if (e->len > 0 && (!st->z || kcmp(e->p, e->len, st->z, st->zl) < 0))
+		{
+			st->z = e->p;
+			st->zl = e->len;
+		}
+		if (st->a && st->z && kcmp(st->a, st->al, st->z, st->zl) >= 0)
+			continue;			/* region outside the scan's range */
+		st->nreg++;
+		return true;
+	}
+}
+
+/* open a scanner on the whole range, or on the next region if parallel */
+static bool
+scan_open(HbState *st)
+{
+	HbScanSpec	s = {0};
+
+	if (st->par)
+	{
+		if (!next_region(st))
+			return false;
+		s.start = st->a;
+		s.startlen = st->al;
+		s.stop = st->z;
+		s.stoplen = st->zl;
+	}
+	else
+	{
+		s.start = st->start;
+		s.startlen = st->startlen;
+		s.stop = st->stop;
+		s.stoplen = st->stoplen;
+	}
+	s.ncols = st->nh;
+	s.cols = st->hcols;
+	s.caching = st->lim > 0 ? Min(st->o.batch, st->lim) : st->o.batch;
+	s.keyonly = st->keyonly;
+	st->sid = hb_scan_open(st->conn, st->o.table, &s);
+	st->open = true;
+	return true;
+}
+
+static bool
+hbIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	return true;				/* each process opens its own connection */
+}
+
+/* leader, before workers start: ask HBase for the regions, size them */
+static Size
+hbEstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
+{
+	HbState    *st = node->fdw_state;
+	MemoryContext old = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+	Size		sz = offsetof(HbPar, d);
+	int			i;
+
+	st->nr = hb_regions(st->conn, st->o.table, &st->rs, &st->re);
+	MemoryContextSwitchTo(old);
+	for (i = 0; i < st->nr; i++)
+		sz += 2 * sizeof(int) + st->rs[i].len + st->re[i].len;
+	return sz;
+}
+
+static void
+put_key(char **p, HbKey *k)
+{
+	memcpy(*p, &k->len, sizeof(int));
+	memcpy(*p + sizeof(int), k->p, k->len);
+	*p += sizeof(int) + k->len;
+}
+
+static void
+get_key(char **p, HbKey *k)
+{
+	memcpy(&k->len, *p, sizeof(int));
+	k->p = *p + sizeof(int);
+	*p += sizeof(int) + k->len;
+}
+
+static void
+hbInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt, void *coord)
+{
+	HbState    *st = node->fdw_state;
+	HbPar	   *par = coord;
+	char	   *p = par->d;
+	int			i;
+
+	pg_atomic_init_u32(&par->next, 0);
+	par->n = st->nr;
+	for (i = 0; i < st->nr; i++)
+	{
+		put_key(&p, &st->rs[i]);
+		put_key(&p, &st->re[i]);
+	}
+	st->par = par;
+}
+
+/* the Gather above is rescanned: hand out the regions again */
+static void
+hbReInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt, void *coord)
+{
+	HbState    *st = node->fdw_state;
+
+	st->par = coord;
+	pg_atomic_write_u32(&st->par->next, 0);
+}
+
+/* worker: read the regions out of shared memory (keys stay in it) */
+static void
+hbInitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc, void *coord)
+{
+	HbState    *st = node->fdw_state;
+	HbPar	   *par = coord;
+	char	   *p = par->d;
+	int			i;
+
+	st->par = par;
+	st->nr = par->n;
+	st->rs = palloc(sizeof(HbKey) * Max(st->nr, 1));
+	st->re = palloc(sizeof(HbKey) * Max(st->nr, 1));
+	for (i = 0; i < st->nr; i++)
+	{
+		get_key(&p, &st->rs[i]);
+		get_key(&p, &st->re[i]);
+	}
+}
+
 static TupleTableSlot *
 hbIterateForeignScan(ForeignScanState *node)
 {
@@ -1738,29 +1958,18 @@ hbIterateForeignScan(ForeignScanState *node)
 			return slot;
 		}
 	}
-	/* a key set is fetched with hb_get_rows below, a range needs a scanner */
-	if (!st->get && !st->open && !st->eof)
-	{
-		HbScanSpec s = {0};
-
-		s.start = st->start;
-		s.startlen = st->startlen;
-		s.stop = st->stop;
-		s.stoplen = st->stoplen;
-		s.ncols = st->nh;
-		s.cols = st->hcols;
-		s.caching = st->lim > 0 ? Min(st->o.batch, st->lim) : st->o.batch;
-		s.keyonly = st->keyonly;
-		st->sid = hb_scan_open(st->conn, st->o.table, &s);
-		st->open = true;
-	}
-
 	while (st->pos >= st->n)
 	{
 		MemoryContext old;
 
 		if (st->eof)
 			return slot;
+		/* a key set is fetched with hb_get_rows below, a range needs a scanner */
+		if (!st->get && !st->open && !scan_open(st))
+		{
+			st->eof = true;
+			return slot;
+		}
 		MemoryContextReset(st->bcxt);
 		old = MemoryContextSwitchTo(st->bcxt);
 		if (st->get)
@@ -1792,9 +2001,10 @@ hbIterateForeignScan(ForeignScanState *node)
 		}
 		if (st->n == 0 && st->open)
 		{
-			st->eof = true;
 			hb_scan_close(st->conn, st->sid);
 			st->open = false;
+			if (!st->par)
+				st->eof = true;	/* parallel: go claim the next region */
 		}
 	}
 
@@ -1811,6 +2021,7 @@ hbReScanForeignScan(ForeignScanState *node)
 		hb_scan_close(st->conn, st->sid);
 	st->begun = st->open = st->eof = false;
 	st->n = st->pos = 0;
+	st->nreg = 0;
 	MemoryContextReset(st->bcxt);
 }
 
@@ -1913,6 +2124,12 @@ hbExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	}
 	if (es->analyze)
 		ExplainPropertyInteger("HBase RPCs", NULL, st->nrpc, es);
+	/* parallel: workers keep their own counts, these are the leader's */
+	if (es->analyze && fs->scan.plan.parallel_aware && st->nr > 0)
+	{
+		ExplainPropertyInteger("HBase Regions", NULL, st->nr, es);
+		ExplainPropertyInteger("Regions Scanned By Leader", NULL, st->nreg, es);
+	}
 	/* the weights the planner costed with (only with measured costs) */
 	if (adaptive && (es->verbose || es->analyze))
 	{
@@ -2565,6 +2782,10 @@ _PG_init(void)
 							"Outer rows per batched join call (K).",
 							NULL, &join_batch, 500, 1, 100000, PGC_USERSET, 0,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("hbase_fdw.parallel_workers",
+							"Workers for a parallel scan of an HBase table, 0 = no parallel scans.",
+							"Each worker and the leader scan whole regions.",
+							&par_workers, 2, 0, 64, PGC_USERSET, 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("hbase_fdw");
 	bj_init();
 }
@@ -2930,6 +3151,11 @@ hbase_fdw_handler(PG_FUNCTION_ARGS)
 	r->GetForeignModifyBatchSize = hbGetForeignModifyBatchSize;
 	r->ExplainForeignModify = hbExplainForeignModify;
 	r->ExecForeignBatchInsert = hbExecForeignBatchInsert;
+	r->IsForeignScanParallelSafe = hbIsForeignScanParallelSafe;
+	r->EstimateDSMForeignScan = hbEstimateDSMForeignScan;
+	r->InitializeDSMForeignScan = hbInitializeDSMForeignScan;
+	r->ReInitializeDSMForeignScan = hbReInitializeDSMForeignScan;
+	r->InitializeWorkerForeignScan = hbInitializeWorkerForeignScan;
 
 	PG_RETURN_POINTER(r);
 }
