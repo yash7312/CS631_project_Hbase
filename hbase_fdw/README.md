@@ -386,10 +386,12 @@ costs 1 RPC per outer row (3), while one on a non-key column still costs
   At run time the leader puts the region keys in shared memory. The leader
   and each worker take the next region with an atomic counter and scan only
   the part of it inside the key range, each over its own connection. The
-  cost is the busiest process's share of round trips and row work, plus 3
-  calls per extra region. Bytes are not divided, because all processes share
-  one network link. It is only offered when the scan fetches at least two
-  batches. EXPLAIN ANALYZE shows `HBase Regions` and the leader's own counts:
+  cost is the busiest process's share of the serial scan (round trips, rows
+  and bytes), plus 3 calls per extra region. With measured costs it also
+  credits back most of Gather's fixed charges: `parallel_setup_cost` (50 ms
+  on our scale) and `parallel_tuple_cost` (5 us a row). Real HBase showed
+  about 1 ms per worker and 2 us per row. It is only offered when the scan
+  fetches at least two batches. EXPLAIN ANALYZE shows `HBase Regions` and the leader's own counts:
   workers keep theirs.
 - **Writes.** INSERT, UPDATE and DELETE need a rowkey column.
   - INSERT is an upsert: an existing key is overwritten, as HBase puts are.

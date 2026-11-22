@@ -1072,8 +1072,7 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 				dis;
 	QualCost	qc;
 	Cost		su,
-				tot,
-				net = 0;		/* the bytes / bandwidth part of tot */
+				tot;
 	int			nw,
 				nr;
 	List	   *pk = key_pathkeys(root, rel, relid, ri->katt);
@@ -1099,7 +1098,6 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 			mtot += Max(0, fetched - rpcs) * w_key[i];
 		su = msu * cpm + qc.startup;
 		tot = mtot * cpm + qc.startup + fetched * (cpu_tuple_cost + qc.per_tuple);
-		net = fetched * bpr / srv_bw(i) * cpm;
 	}
 	else
 	{
@@ -1136,8 +1134,10 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 	 * scan takes about k / regions of the serial round trips and row work.
 	 * nw is the fewest workers that reach the smallest k (4 regions and at
 	 * most 2 workers: 1 worker, 2 regions each). Each region costs about 3
-	 * extra calls (open, last empty batch, close). The bytes still cross one
-	 * network link, so that part does not shrink. Only when every process
+	 * extra calls (open, last empty batch, close). The bytes part shrinks
+	 * too: on real HBase "bandwidth" was mostly the server packing rows, and
+	 * SELECT * ran 47 -> 23 ms with 3 workers (a truly full link would not
+	 * shrink, we did not measure one). Only when every process
 	 * gets at least one full batch, and the table has 2 or more regions.
 	 */
 	nw = Min(par_workers, max_parallel_workers_per_gather);
@@ -1156,7 +1156,24 @@ add_hb_path(PlannerInfo *root, RelOptInfo *rel, Oid relid, List *clauses,
 			call = srv_call(find_srv(GetForeignTable(relid)->serverid, &ri->o, relid)) * cpm;
 		else
 			call = HB_RPC_COST;
-		ptot = su + (tot - su - net + 3 * (nr - 1) * call) * k / nr + net;
+		ptot = su + (tot - su + 3 * (nr - 1) * call) * k / nr;
+
+		/*
+		 * With measured costs one cost unit is 1/cost_per_ms ms, and the
+		 * Gather above us charges parallel_setup_cost (1000 = 50 ms) plus
+		 * parallel_tuple_cost per row (0.1 = 5 us). Real HBase showed about
+		 * 1 ms per worker and a few us per row, so we credit the difference
+		 * here. Without it a 3-worker scan that ran 24 -> 16 ms and
+		 * 127 -> 85 ms was never picked.
+		 */
+		if (adaptive)
+		{
+			Cost		cr = parallel_setup_cost - nw * 1.0 * cpm +
+				(parallel_tuple_cost - 0.002 * cpm) * rows;
+
+			if (cr > 0)
+				ptot = Max(su, ptot - cr);
+		}
 
 #if PG_VERSION_NUM >= 180000
 		p = create_foreignscan_path(root, rel, NULL, rows / (nw + 1), dis ? 1 : 0, su, ptot,
