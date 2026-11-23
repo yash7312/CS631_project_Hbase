@@ -17,3 +17,8 @@ hbase_fdw/tmp_check/
 __pycache__/
 *.pyc
 tmp/
+
+# LaTeX build files
+docs/*.aux
+docs/*.log
+docs/*.out
