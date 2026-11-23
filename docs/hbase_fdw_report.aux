@@ -1,0 +1,71 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand*\HyPL@Entry[1]{}
+\HyPL@Entry{0<</S/D>>}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Contributions.}{1}{paragraph*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{HBase.}{2}{paragraph*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{PostgreSQL FDWs.}{2}{paragraph*.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces The layers a query passes through. The proxy is inserted only for experiments.}}{2}{figure.caption.4}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:arch}{{1}{2}{The layers a query passes through. The proxy is inserted only for experiments}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}The Base Wrapper}{2}{section.3}\protected@file@percent }
+\newlabel{sec:base}{{3}{2}{The Base Wrapper}{section.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Key pushdown.}{2}{paragraph*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Planner integration.}{2}{paragraph*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}A Latency Proxy}{2}{section.4}\protected@file@percent }
+\newlabel{sec:proxy}{{4}{2}{A Latency Proxy}{section.4}{}}
+\citation{guravannavar08}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Base wrapper on real HBase, 10{,}000 rows, one machine (median of 10--50 runs).}}{3}{table.caption.7}\protected@file@percent }
+\newlabel{tab:base}{{1}{3}{Base wrapper on real HBase, 10{,}000 rows, one machine (median of 10--50 runs)}{table.caption.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Accuracy.}{3}{paragraph*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Measured Cost Weights}{3}{section.5}\protected@file@percent }
+\newlabel{sec:costs}{{5}{3}{Measured Cost Weights}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Measuring.}{3}{paragraph*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why it matters.}{3}{paragraph*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Batched Index Join}{4}{section.6}\protected@file@percent }
+\newlabel{sec:batch}{{6}{4}{Batched Index Join}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Planning.}{4}{paragraph*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Execution.}{4}{paragraph*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Left joins.}{4}{paragraph*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Writes}{4}{section.7}\protected@file@percent }
+\newlabel{sec:writes}{{7}{4}{Writes}{section.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Parallel Scan by Region}{4}{section.8}\protected@file@percent }
+\newlabel{sec:parallel}{{8}{4}{Parallel Scan by Region}{section.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Execution.}{4}{paragraph*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Planning.}{5}{paragraph*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Evaluation}{5}{section.9}\protected@file@percent }
+\newlabel{sec:eval}{{9}{5}{Evaluation}{section.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{Setup.}{5}{paragraph*.16}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Mean plan regret, fixed against measured costs, 9 outer sizes per point. Fixed costs are worst on a slow link with no added latency (6.5$\times $ at 10\,Mbit/s, RTT~0); measured costs stay near 1.0 everywhere.}}{5}{figure.caption.17}\protected@file@percent }
+\newlabel{fig:regret}{{2}{5}{Mean plan regret, fixed against measured costs, 9 outer sizes per point. Fixed costs are worst on a slow link with no added latency (6.5$\times $ at 10\,Mbit/s, RTT~0); measured costs stay near 1.0 everywhere}{figure.caption.17}{}}
+\@writefile{toc}{\contentsline {paragraph}{Plan quality.}{5}{paragraph*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Break-even.}{5}{paragraph*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Join methods.}{5}{paragraph*.22}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Outer rows at which a hash join starts to beat per-row gets. Fixed costs always switch at 30; measured costs track the true break-even, which ranges from 15 to over 300 rows.}}{6}{figure.caption.19}\protected@file@percent }
+\newlabel{fig:breakeven}{{3}{6}{Outer rows at which a hash join starts to beat per-row gets. Fixed costs always switch at 30; measured costs track the true break-even, which ranges from 15 to over 300 rows}{figure.caption.19}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Join time against outer rows for each method, forced. The batched join is fastest from 10 outer rows up; per-row gets grow linearly with $n$.}}{6}{figure.caption.21}\protected@file@percent }
+\newlabel{fig:join}{{4}{6}{Join time against outer rows for each method, forced. The batched join is fastest from 10 outer rows up; per-row gets grow linearly with $n$}{figure.caption.21}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Time to write 1{,}000 rows. Batching inserts cuts 7.0\,s to 0.12\,s at 5\,ms RTT; updates and deletes still make one call per row.}}{6}{figure.caption.23}\protected@file@percent }
+\newlabel{fig:writes}{{5}{6}{Time to write 1{,}000 rows. Batching inserts cuts 7.0\,s to 0.12\,s at 5\,ms RTT; updates and deletes still make one call per row}{figure.caption.23}{}}
+\citation{vonng}
+\citation{phoenix}
+\citation{pgfdw}
+\citation{mackert86}
+\citation{haas97}
+\citation{guravannavar08}
+\@writefile{toc}{\contentsline {paragraph}{Writes.}{7}{paragraph*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Parallel scan.}{7}{paragraph*.25}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Scan time in ms, a 10{,}000-row table in four regions, median of 5 runs.}}{7}{table.caption.26}\protected@file@percent }
+\newlabel{tab:par}{{2}{7}{Scan time in ms, a 10{,}000-row table in four regions, median of 5 runs}{table.caption.26}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Related Work}{7}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Limitations and Future Work}{7}{section.11}\protected@file@percent }
+\bibcite{guravannavar08}{1}
+\bibcite{haas97}{2}
+\bibcite{mackert86}{3}
+\bibcite{phoenix}{4}
+\bibcite{pgfdw}{5}
+\bibcite{vonng}{6}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Conclusion}{8}{section.12}\protected@file@percent }
+\gdef \@abspage@last{8}
