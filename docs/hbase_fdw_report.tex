@@ -17,12 +17,12 @@
 \usepackage[hidelinks]{hyperref}
 
 \titleformat{\section}{\sffamily\large\bfseries}{\thesection}{0.6em}{}
-\titlespacing*{\section}{0pt}{9pt}{4pt}
+\titlespacing*{\section}{0pt}{7pt}{3pt}
 \titleformat{\subsection}{\sffamily\normalsize\bfseries}{\thesubsection}{0.5em}{}
 \titlespacing*{\subsection}{0pt}{6pt}{2pt}
 \captionsetup{font=small,labelfont=bf,skip=4pt}
 \setlist{nosep,leftmargin=1.3em,itemsep=2pt}
-\setlength{\parskip}{3pt}
+\setlength{\parskip}{2pt}
 \newcommand{\code}[1]{\texttt{#1}}
 \renewcommand{\arraystretch}{1.15}
 % let figures sit with the text instead of piling up at the end
@@ -35,7 +35,8 @@
 
 \title{\sffamily\bfseries hbase\_fdw: Network-Aware Querying of HBase from PostgreSQL}
 \author{Yash Singh (23B0934)\\[2pt]
-\small CS631 Course Project, IIT Bombay, November 2026}
+\small CS631 Course Project, IIT Bombay, November 2026\\[4pt]
+\normalsize\textbf{Code repository (public):} \url{https://github.com/yash7312/CS631_project_Hbase}}
 \date{}
 
 \begin{document}
@@ -43,6 +44,15 @@
 
 \section{Introduction}
 \code{hbase\_fdw} lets PostgreSQL~18 query HBase~3.0 tables in place, with ordinary SQL and without copying data. The aim is to use HBase's sorted row key like an index, and to make the planner choose plans from what the network between the two systems really costs.
+
+\section{Who Did What}
+We used Claude (Anthropic), an AI assistant, throughout this project, so we state plainly what was whose.
+
+\textbf{Done by the AI.} Claude wrote nearly all of the code and text from our instructions: the C wrapper and the Thrift client, the regression tests and the in-memory mock HBase, the latency proxy, the benchmark and plotting scripts, \code{setup.sh} and the demo scripts, this report and the slides.
+
+\textbf{Done by us.} We chose the project and its scope and decided what to build at each step, for example the latency proxy and measured cost weights so that plans hold up beyond one machine. We reviewed the work, ran the real-HBase tests on our own machine (the regression suites, the demo, the checks of parallel scans) and reported results and failures back. At our request, statements in this report that had no saved source were removed.
+
+\textbf{Repository.} \code{hbase\_fdw} is a new PostgreSQL extension, not a patch to PostgreSQL, so there is no upstream source to clone: the repository holds only our own files and its history shows every change. \code{setup.sh} downloads and builds unmodified PostgreSQL~18 and HBase~3.0.
 
 \section{Background}
 \paragraph{HBase.} A table is a sorted map from row key to cells named \code{family:qualifier}. Only the row key is indexed. HBase compares keys as raw bytes; a scan takes an inclusive start row and an exclusive stop row. We use the Thrift1 gateway, which offers gets of many keys at once (\code{getRowsWithColumns}), scanners that return rows in batches, and writes (\code{mutateRow}, \code{mutateRows}, \code{deleteAllRow}).
@@ -175,7 +185,7 @@ Figure~\ref{fig:breakeven} shows why: the true break-even moves from 15 rows (fa
 
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=0.8\textwidth]{../graphs/fig2_join_time.png}
+\includegraphics[width=0.72\textwidth]{../graphs/fig2_join_time.png}
 \caption{Join time against outer rows for each method, forced, at RTT 5 and 20\,ms with no bandwidth cap. The batched join is fastest from 10 outer rows up.}
 \label{fig:join}
 \end{figure}
@@ -184,7 +194,7 @@ Figure~\ref{fig:breakeven} shows why: the true break-even moves from 15 rows (fa
 
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=0.5\textwidth]{../graphs/fig4_writes.png}
+\includegraphics[width=0.44\textwidth]{../graphs/fig4_writes.png}
 \caption{Time to write 1{,}000 rows. Batching inserts cuts 7.0\,s to 0.12\,s at 5\,ms RTT; updates and deletes still make one call per row.}
 \label{fig:writes}
 \end{figure}
