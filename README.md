@@ -10,8 +10,12 @@ Postgres uses an index. Nothing is copied into Postgres.
   gets and range scans instead of full scans.
 - The planner gets row estimates, costs and the key order, so it prefers key
   lookups and skips sorts.
-- Joins on the row key look up each match in HBase, like a nested-loop index
-  scan.
+- Joins on the row key look up each match in HBase, either one get per outer
+  row or, with the batched join, one call for hundreds of outer rows.
+- The planner measures the round-trip time and bandwidth of the connection and
+  costs plans from those numbers instead of fixed constants.
+- `INSERT` (batched), `UPDATE` and `DELETE` write to HBase.
+- Large scans can run in parallel, one HBase region per worker.
 
 On a 10,000-row table, a point lookup went from 36.8 ms to 1.5 ms. The full
 write-up is in [`docs/hbase_fdw_report.pdf`](docs/hbase_fdw_report.pdf).
@@ -40,6 +44,15 @@ in-memory mock HBase instead.
 | `./setup.sh proxy on` / `off` | point server `hb` in database `test` at the proxy, or back at 9090 |
 | `./setup.sh proxy stop` | stop the proxy |
 
+### Demo (read, insert, delete)
+
+```bash
+./demo/start.sh                         # start everything and check it
+source work/env.sh
+psql -a -d demo -f demo/demo.sql        # read, insert, delete on the emp table
+./demo/stop.sh
+```
+
 ### Testing over a slow network on one machine
 
 `hbase_fdw/test/netem_proxy.py` sits between PostgreSQL and the Thrift gateway
@@ -67,5 +80,6 @@ Already have your own PostgreSQL build? Build the extension against it with
 | `hbase_fdw/test/` | data loader, mock HBase, delay proxy, sweep and benchmark scripts, Thrift IDL |
 | `results/` | real-HBase measurements (CSV) behind the graphs |
 | `graphs/` | one short script per report figure and the PNGs; `bash graphs/make_all.sh` redraws them |
-| `docs/` | report (PDF and LaTeX), handoff notes and the work log |
+| `demo/` | start, check and stop scripts and the read/insert/delete demo |
+| `docs/` | report (PDF and LaTeX), slides (PDF), handoff notes and the work log |
 | `setup.sh` | one-command build, start, stop and test |
